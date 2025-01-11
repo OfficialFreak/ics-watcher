@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ical = "0.11.0"
+ciborium = "0.2.2"
+ical = { version = "0.11.0", features = ["serde-derive"] }
 reqwest = { version = "0.12.12", features = ["blocking"] }
+sanitize-filename = "0.6.0"

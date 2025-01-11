@@ -1,4 +1,11 @@
-use std::{collections::HashMap, io::BufReader, thread, time::Duration};
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::BufReader,
+    path::Path,
+    thread,
+    time::Duration,
+};
 
 use ical::{
     parser::{
@@ -8,6 +15,7 @@ use ical::{
     property::Property,
     IcalParser,
 };
+use sanitize_filename::sanitize;
 
 fn rfc5545_to_std_duration(rfc_duration: &str) -> Duration {
     let duration_str = rfc_duration.trim_start_matches('P').replace('T', "");
@@ -146,6 +154,11 @@ impl CalendarChangeDetector {
         }
     }
 
+    pub fn set_state(&mut self, state: HashMap<String, IcalEvent>) {
+        self.previous = state;
+        self.initialized = true;
+    }
+
     pub fn compare(&mut self, calendar: IcalCalendar) -> Vec<CalendarEvent> {
         self.name = calendar
             .get_property("X-WR-CALNAME")
@@ -232,8 +245,6 @@ impl CalendarChangeDetector {
 }
 
 pub struct ICSWatcher<'a> {
-    // usize is the n-th calendar inside of the ics file
-    // You can ignore it to handle all calendars the same
     ics_link: &'a str,
     pub callbacks: Vec<Box<dyn Fn(&Option<String>, &Option<String>, &Vec<CalendarEvent>)>>,
     change_detector: CalendarChangeDetector,
@@ -251,27 +262,61 @@ impl<'a> ICSWatcher<'a> {
         }
     }
 
+    pub fn restore_state(&mut self, state: HashMap<String, IcalEvent>) {
+        self.change_detector.set_state(state);
+    }
+
+    pub fn get_state(&self) -> &HashMap<String, IcalEvent> {
+        &self.change_detector.previous
+    }
+
+    pub fn get_calendar_name(&self) -> Option<String> {
+        self.change_detector.name.clone()
+    }
+
+    pub fn create_backup(&self, name: &str) {
+        let backup_file_path = Path::new(".backups").join(sanitize(name) + ".cbor");
+
+        fs::create_dir_all(".backups").expect("Failed to create .backups folder");
+        let backup_file = File::create(backup_file_path).expect("Failed to create backup file");
+        ciborium::ser::into_writer(self.get_state(), backup_file)
+            .expect("Failed to create and write backup");
+    }
+
+    pub fn load_backup(&mut self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let backup_file_path = File::open(Path::new(".backups").join(sanitize(name) + ".cbor"))?;
+
+        let state = ciborium::de::from_reader(backup_file_path)?;
+        self.restore_state(state);
+
+        Ok(())
+    }
+
+    pub fn update(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let res = reqwest::blocking::get(self.ics_link)?;
+
+        let buf = BufReader::new(res);
+        let calendar = IcalParser::new(buf).next().unwrap().unwrap();
+
+        let events = self.change_detector.compare(calendar);
+
+        if !events.is_empty() {
+            for callback in &self.callbacks {
+                callback(
+                    &self.change_detector.name,
+                    &self.change_detector.description,
+                    &events,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
-            let res = reqwest::blocking::get(self.ics_link)?;
-
-            let buf = BufReader::new(res);
-            let calendar = IcalParser::new(buf).next().unwrap().unwrap();
-
-            let events = self.change_detector.compare(calendar);
-
-            if !events.is_empty() {
-                for callback in &self.callbacks {
-                    callback(
-                        &self.change_detector.name,
-                        &self.change_detector.description,
-                        &events,
-                    );
-                }
-            }
-
-            // thread::sleep(self.change_detector.ttl);
-            thread::sleep(Duration::from_secs(1));
+            self.update()?;
+            thread::sleep(self.change_detector.ttl);
         }
     }
 }
@@ -310,14 +355,340 @@ pub fn print_events(
     }
 }
 
-// TODO: Add tests
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-//     #[test]
-//     fn it_works() {
-//         let result = add(2, 2);
-//         assert_eq!(result, 4);
-//     }
-// }
+    #[test]
+    fn cmp_no_properties() {
+        let event1 = IcalEvent {
+            properties: vec![],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2);
+
+        assert_eq!(keys, None);
+    }
+
+    #[test]
+    fn cmp_same_properties() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: Some(String::from("prop1 value")),
+            params: None,
+        };
+
+        let prop2 = Property {
+            name: String::from("prop2"),
+            value: Some(String::from("prop2 value")),
+            params: None,
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1.clone(), prop2.clone()],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2.clone(), prop1.clone()],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2);
+
+        assert_eq!(keys, None);
+    }
+
+    #[test]
+    fn cmp_different_properties() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: Some(String::from("prop1 value")),
+            params: None,
+        };
+
+        let prop2 = Property {
+            name: String::from("prop2"),
+            value: Some(String::from("prop2 value")),
+            params: None,
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&String::from("prop1")) && keys.contains(&String::from("prop2")));
+    }
+
+    #[test]
+    fn cmp_added_property() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: Some(String::from("prop1 value")),
+            params: None,
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&String::from("prop1")));
+    }
+
+    #[test]
+    fn cmp_removed_property() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: Some(String::from("prop1 value")),
+            params: None,
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&String::from("prop1")));
+    }
+
+    #[test]
+    fn cmp_different_properties_no_value() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: None,
+        };
+
+        let prop2 = Property {
+            name: String::from("prop2"),
+            value: None,
+            params: None,
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&String::from("prop1")) && keys.contains(&String::from("prop2")));
+    }
+
+    #[test]
+    fn cmp_different_params() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value")])]),
+        };
+
+        let prop2 = Property {
+            name: String::from("prop2"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value")])]),
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&String::from("prop1")) && keys.contains(&String::from("prop2")));
+    }
+
+    #[test]
+    fn cmp_same_params() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value")])]),
+        };
+
+        let prop2 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value")])]),
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2);
+
+        assert_eq!(keys, None);
+    }
+
+    #[test]
+    fn cmp_different_param_keys() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value")])]),
+        };
+
+        let prop2 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key2"), vec![String::from("value")])]),
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&String::from("prop1")));
+    }
+
+    #[test]
+    fn cmp_different_param_values() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value")])]),
+        };
+
+        let prop2 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value2")])]),
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&String::from("prop1")));
+    }
+
+    #[test]
+    fn cmp_added_param() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: None,
+        };
+
+        let prop2 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value2")])]),
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&String::from("prop1")));
+    }
+
+    #[test]
+    fn cmp_removed_param() {
+        let prop1 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: Some(vec![(String::from("key"), vec![String::from("value2")])]),
+        };
+
+        let prop2 = Property {
+            name: String::from("prop1"),
+            value: None,
+            params: None,
+        };
+
+        let event1 = IcalEvent {
+            properties: vec![prop1],
+            alarms: vec![],
+        };
+
+        let event2 = IcalEvent {
+            properties: vec![prop2],
+            alarms: vec![],
+        };
+
+        let keys = changed_properties(&event1, &event2).expect("Keys should be Some");
+
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&String::from("prop1")));
+    }
+}
