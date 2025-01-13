@@ -684,6 +684,14 @@ async fn update_event(
                     }
                 }
             } else {
+                if oringinal_event
+                    .summary
+                    .clone()
+                    .is_some_and(|summary| summary.contains("Prüfung"))
+                {
+                    // Big important :o
+                    google_event.color_id = Some(String::from("11"));
+                }
                 google_event.summary = oringinal_event.summary;
             }
 
