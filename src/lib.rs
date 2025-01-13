@@ -1,3 +1,8 @@
+//! A lightweight crate for monitoring iCalendar (ICS) files or links and detecting changes, additions, and removals.
+//! Provides an API to watch calendars and receive notifications through customizable callbacks.
+//!
+//! See [ICSWatcher] to get started.
+
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -127,12 +132,29 @@ fn changed_properties(event1: &IcalEvent, event2: &IcalEvent) -> Option<Vec<Stri
     }
 }
 
+/// A helper struct to save an [IcalEvent] with its uid
 #[derive(Debug, Clone)]
 pub struct EventData {
     pub uid: String,
     pub ical_data: IcalEvent,
 }
 
+/// A struct denoting a Property Change of a [key](`PropertyChange::key`) with both states in [from](`PropertyChange::from`) and [to](`PropertyChange::to`).
+///
+/// # Examples
+///
+/// ```
+/// // A description has been added with the contents "New Description"
+/// PropertyChange {
+///     key: "DESCRIPTION".to_string(),
+///     from: None,
+///     to: Some(Property {
+///         name: "DESCRIPTION".to_string(),
+///         params: None,
+///         value: Some("New Description".to_string())
+///     })
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct PropertyChange {
     pub key: String,
@@ -140,6 +162,13 @@ pub struct PropertyChange {
     pub to: Option<Property>,
 }
 
+/// Used to pass the events to the callbacks.
+///
+/// The types:
+/// - [`CalendarEvent::Setup`]: If the ICS Watcher is being initialized for the first time, all events that are found will be passed as [`CalendarEvent::Setup`]
+/// - [`CalendarEvent::Created`]: If the ICS Watcher has been running, any new events found will be passed as [`CalendarEvent::Created`]
+/// - [`CalendarEvent::Updated`]: Any events with different properties. The changed properties, along with both the before and after state will be passed in [`CalendarEvent::Updated::changed_properties`]
+/// - [`CalendarEvent::Deleted`]: If an event is not found anymore, it is being passed as [`CalendarEvent::Deleted`]
 #[derive(Debug, Clone)]
 pub enum CalendarEvent {
     Setup(EventData),
@@ -153,6 +182,8 @@ pub enum CalendarEvent {
     },
 }
 
+/// Handling change detection of a single calendar (as one ics file can contain multiple calendars)
+/// For usage details, see [ICSWatcher]
 #[derive(Debug)]
 pub struct CalendarChangeDetector {
     pub name: Option<String>,
@@ -279,6 +310,29 @@ pub type CalendarCallback = Box<
         Vec<CalendarEvent>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>,
 >;
+/// Instantiate an [ICSWatcher] using [ICSWatcher::new] to watch for changes of an ics link.
+///
+/// Using this, you can also [create](`ICSWatcher::create_backup`) and [load](`ICSWatcher::load_backup`) backups.
+/// If you want to handle when the watcher updates, you can manually call the [`ICSWatcher::update`] method.
+///
+/// # Examples
+///
+/// ```
+/// let mut ics_watcher = ICSWatcher::new(
+///     "some url",
+///     vec![
+///         Box::new(|a, b, e| Box::pin(async move { log_events(a, b, e).await })),
+///     ],
+/// );
+
+/// // Try to load backup
+/// let _ = ics_watcher.load_backup("Your Calendar");
+/// // Run ics watcher infinitely and save backups as "Your Calendar"
+/// ics_watcher
+///     .run(Option::from("Your Calendar"))
+///     .await
+///     .expect("ICS Watcher crashed");
+/// ```
 pub struct ICSWatcher<'a> {
     ics_link: &'a str,
     pub callbacks: Vec<CalendarCallback>,
@@ -365,7 +419,28 @@ impl<'a> ICSWatcher<'a> {
     }
 }
 
-pub async fn print_events(
+/// This is a callback which logs all events.
+///
+/// This can come in useful during debugging or when deploying to check the logs later on.
+///
+/// # Examples
+///
+/// ```
+/// let mut ics_watcher = ICSWatcher::new(
+///     "some url",
+///     vec![
+///         Box::new(|a, b, e| Box::pin(async move { log_events(a, b, e).await })),
+///     ],
+/// );
+///
+/// // Try to load backup
+/// let _ = ics_watcher.load_backup("Your Calendar");
+/// ics_watcher
+///     .run(Option::from("Your Calendar"))
+///     .await
+///     .expect("ICS Watcher crashed");
+/// ```
+pub async fn log_events(
     name: Option<String>,
     description: Option<String>,
     events: Vec<CalendarEvent>,
@@ -435,16 +510,16 @@ fn replace_courses(input: &str) -> String {
 fn convert_to_non_digits(str: String) -> String {
     str.chars()
         .map(|c| match c {
-            '0' => '𝟎', // Mathematical Bold Digit Zero
-            '1' => '𝟏', // Mathematical Bold Digit One
-            '2' => '𝟐', // Mathematical Bold Digit Two
-            '3' => '𝟑', // Mathematical Bold Digit Three
-            '4' => '𝟒', // Mathematical Bold Digit Four
-            '5' => '𝟓', // Mathematical Bold Digit Five
-            '6' => '𝟔', // Mathematical Bold Digit Six
-            '7' => '𝟕', // Mathematical Bold Digit Seven
-            '8' => '𝟖', // Mathematical Bold Digit Eight
-            '9' => '𝟗', // Mathematical Bold Digit Nine
+            '0' => '𝟎',
+            '1' => '𝟏',
+            '2' => '𝟐',
+            '3' => '𝟑',
+            '4' => '𝟒',
+            '5' => '𝟓',
+            '6' => '𝟔',
+            '7' => '𝟕',
+            '8' => '𝟖',
+            '9' => '𝟗',
             other => other,
         })
         .collect::<String>()
@@ -819,6 +894,31 @@ async fn delete_event(
     Ok(result)
 }
 
+/// This is a callback which synchronizes your TUM Calendar to your Google Calender.
+///
+/// The event summaries will be shortened and the events themselves modifieable. As soon as you delete an event, it won't come back.
+/// If you modify an event, your changes will only be overwritten if they're changed in the TUM Calendar.
+///
+/// # Examples
+///
+/// ```
+/// let mut ics_watcher = ICSWatcher::new(
+///     tum_url.as_str(),
+///     vec![
+///         Box::new(move |a, b, e| {
+///             let calendar_id = google_calendar_id.clone();
+///             Box::pin(async move { tum_google_sync(&calendar_id, a, b, e).await })
+///         }),
+///     ],
+/// );
+
+/// // Try to load backup
+/// let _ = ics_watcher.load_backup("TUM Calendar");
+/// ics_watcher
+///     .run(Option::from("TUM Calendar"))
+///     .await
+///     .expect("ICS Watcher crashed");
+/// ```
 pub async fn tum_google_sync(
     calendar_id: &str,
     _: Option<String>,
