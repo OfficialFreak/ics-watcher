@@ -589,6 +589,35 @@ async fn update_event(
     property_changes: Vec<PropertyChange>,
     calendar_id: &str,
 ) -> Result<Response<BoxBody<Bytes, Error>>, Box<dyn std::error::Error + Send + Sync>> {
+    // The TUM Calendar seems to randomly serve english / german descriptions
+    // This looks for differences other than the first two words in english / german
+    if property_changes.len() == 1
+        && property_changes[0].key == "DESCRIPTION"
+        && property_changes[0]
+            .from
+            .as_ref()
+            .and_then(|from| from.value.as_ref())
+            .zip(
+                property_changes[0]
+                    .to
+                    .as_ref()
+                    .and_then(|to| to.value.as_ref()),
+            )
+            .map_or(false, |(from, to)| {
+                from.split(";").skip(2).collect::<String>()
+                    == to.split(";").skip(2).collect::<String>()
+            })
+    {
+        println!("Skipping language-only update. {uid}");
+        let response = Response::builder()
+            .status(StatusCode::IM_A_TEAPOT)
+            .body(BoxBody::default())
+            .unwrap();
+
+        return Ok(response);
+    }
+    println!("Updating event {uid}");
+
     let i_cal_uid = convert_to_non_digits(uid.replace("@tum.de", "|").to_string());
     let results = hub
         .events()
@@ -865,10 +894,7 @@ pub async fn tum_google_sync(
             CalendarEvent::Updated {
                 event: EventData { uid, ical_data },
                 changed_properties,
-            } => {
-                println!("Updating event {uid}");
-                update_event(hub, uid, ical_data, changed_properties, calendar_id).await
-            }
+            } => update_event(hub, uid, ical_data, changed_properties, calendar_id).await,
             CalendarEvent::Deleted { uid } => {
                 println!("Deleting event {uid}");
                 delete_event(hub, uid, calendar_id).await
