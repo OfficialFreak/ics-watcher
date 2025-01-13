@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chrono = "0.4.39"
+chrono-tz = "0.10.0"
 ciborium = "0.2.2"
+futures = "0.3.31"
+google-calendar3 = "6.0.0"
+http-body-util = "0.1.2"
 ical = { version = "0.11.0", features = ["serde-derive"] }
-reqwest = { version = "0.12.12", features = ["blocking"] }
+lazy_static = "1.5.0"
+regex = "1.11.1"
+reqwest = { version = "0.12.12" }
 sanitize-filename = "0.6.0"
+serde_json = "1.0.135"
+tokio = { version = "1.43.0", features = ["full"] }

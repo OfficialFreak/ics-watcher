@@ -1,11 +1,16 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
+    future::Future,
     io::BufReader,
     path::Path,
-    thread,
+    pin::Pin,
+    sync::Arc,
     time::Duration,
 };
+
+use chrono::NaiveDateTime;
+use http_body_util::combinators::BoxBody;
 
 use ical::{
     parser::{
@@ -15,7 +20,21 @@ use ical::{
     property::Property,
     IcalParser,
 };
+
+use google_calendar3::{
+    api::{Event, EventDateTime},
+    hyper::{body::Bytes, Error, Response},
+    hyper_rustls::{self, HttpsConnector},
+    hyper_util::{self, client::legacy::connect::HttpConnector},
+    yup_oauth2::{self, read_application_secret},
+    CalendarHub,
+};
+
+use lazy_static::lazy_static;
+use regex::Regex;
+use reqwest::StatusCode;
 use sanitize_filename::sanitize;
+use tokio::time::sleep;
 
 fn rfc5545_to_std_duration(rfc_duration: &str) -> Duration {
     let duration_str = rfc_duration.trim_start_matches('P').replace('T', "");
@@ -108,20 +127,20 @@ fn changed_properties(event1: &IcalEvent, event2: &IcalEvent) -> Option<Vec<Stri
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EventData {
     pub uid: String,
     pub ical_data: IcalEvent,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PropertyChange {
     pub key: String,
     pub from: Option<Property>,
     pub to: Option<Property>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CalendarEvent {
     Setup(EventData),
     Created(EventData),
@@ -183,11 +202,20 @@ impl CalendarChangeDetector {
                 .get_property("UID")
                 .and_then(|prop| prop.value.clone())
                 .expect("Event is missing a UID")
-                + event
+                + &event
                     .get_property("RECURRENCE-ID")
-                    .and_then(|prop| prop.value.clone())
+                    .map(|prop| match prop.value.clone() {
+                        Some(v) => v,
+                        None => String::from("R"),
+                    })
                     .unwrap_or(String::from(""))
-                    .as_str();
+                + &event
+                    .get_property("X-CO-RECURRINGID")
+                    .map(|prop| match prop.value.clone() {
+                        Some(v) => v,
+                        None => String::from("XR"),
+                    })
+                    .unwrap_or(String::from(""));
 
             new_previous.insert(event_uid.clone(), event.clone());
             if self.initialized {
@@ -244,17 +272,21 @@ impl CalendarChangeDetector {
     }
 }
 
+pub type CalendarCallback = Box<
+    dyn Fn(
+        Option<String>,
+        Option<String>,
+        Vec<CalendarEvent>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>,
+>;
 pub struct ICSWatcher<'a> {
     ics_link: &'a str,
-    pub callbacks: Vec<Box<dyn Fn(&Option<String>, &Option<String>, &Vec<CalendarEvent>)>>,
+    pub callbacks: Vec<CalendarCallback>,
     change_detector: CalendarChangeDetector,
 }
 
 impl<'a> ICSWatcher<'a> {
-    pub fn new(
-        ics_link: &'a str,
-        callbacks: Vec<Box<dyn Fn(&Option<String>, &Option<String>, &Vec<CalendarEvent>)>>,
-    ) -> Self {
+    pub fn new(ics_link: &'a str, callbacks: Vec<CalendarCallback>) -> Self {
         ICSWatcher {
             ics_link,
             callbacks,
@@ -292,39 +324,51 @@ impl<'a> ICSWatcher<'a> {
         Ok(())
     }
 
-    pub fn update(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let res = reqwest::blocking::get(self.ics_link)?;
+    pub async fn update(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let res = reqwest::get(self.ics_link).await?.text().await?;
 
-        let buf = BufReader::new(res);
+        let buf = BufReader::new(res.as_bytes());
         let calendar = IcalParser::new(buf).next().unwrap().unwrap();
 
         let events = self.change_detector.compare(calendar);
 
         if !events.is_empty() {
-            for callback in &self.callbacks {
-                callback(
-                    &self.change_detector.name,
-                    &self.change_detector.description,
-                    &events,
-                );
+            let futures: Vec<_> = self
+                .callbacks
+                .iter()
+                .map(|callback| {
+                    callback(
+                        self.change_detector.name.clone(),
+                        self.change_detector.description.clone(),
+                        events.clone(),
+                    )
+                })
+                .collect();
+
+            for future in futures {
+                future.await;
             }
         }
 
         Ok(())
     }
 
-    pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(&mut self, backup: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         loop {
-            self.update()?;
-            thread::sleep(self.change_detector.ttl);
+            self.update().await?;
+            if let Some(path) = backup {
+                self.create_backup(path);
+            }
+            println!("Refreshing in {:?}", self.change_detector.ttl);
+            sleep(self.change_detector.ttl).await;
         }
     }
 }
 
-pub fn print_events(
-    name: &Option<String>,
-    description: &Option<String>,
-    events: &Vec<CalendarEvent>,
+pub async fn print_events(
+    name: Option<String>,
+    description: Option<String>,
+    events: Vec<CalendarEvent>,
 ) {
     println!(
         "Captured changes of {}{}:",
@@ -352,6 +396,471 @@ pub fn print_events(
                 println!("Deleted {uid}\n")
             }
         }
+    }
+}
+
+lazy_static! {
+    static ref REPLACEMENTS: Arc<Vec<(String, String)>> = {
+        let courses_json = include_str!("../replacements.json");  // Path relative to src/
+        let raw_replacements: HashMap<String, String> = serde_json::from_str(courses_json).unwrap();
+
+        let mut replacements: Vec<(String, String)> = raw_replacements.into_iter().collect();
+        replacements.sort_by(|(a_key, _), (b_key, _)| {
+            if a_key.len() != b_key.len() {
+                b_key.len().cmp(&a_key.len())
+            } else {
+                a_key.cmp(b_key)
+            }
+        });
+
+        Arc::new(replacements)
+    };
+}
+
+fn remove_lv_id(text: &str) -> String {
+    // Matches [AA1234] or (AA1234) where A is any uppercase letter and 1234 is any four digits
+    let pattern = r"\[(([A-Z]{2})(\d{4}))\]|\((([A-Z]{2})(\d{4}))\)";
+    let regex = Regex::new(pattern).unwrap();
+    regex.replace_all(text, "").to_string()
+}
+
+fn replace_courses(input: &str) -> String {
+    let mut result = input.to_string();
+    for (from, to) in REPLACEMENTS.iter() {
+        result = result.replace(from, to);
+    }
+    remove_lv_id(result.as_str())
+}
+
+fn convert_to_non_digits(str: String) -> String {
+    str.chars()
+        .map(|c| match c {
+            '0' => '𝟎', // Mathematical Bold Digit Zero
+            '1' => '𝟏', // Mathematical Bold Digit One
+            '2' => '𝟐', // Mathematical Bold Digit Two
+            '3' => '𝟑', // Mathematical Bold Digit Three
+            '4' => '𝟒', // Mathematical Bold Digit Four
+            '5' => '𝟓', // Mathematical Bold Digit Five
+            '6' => '𝟔', // Mathematical Bold Digit Six
+            '7' => '𝟕', // Mathematical Bold Digit Seven
+            '8' => '𝟖', // Mathematical Bold Digit Eight
+            '9' => '𝟗', // Mathematical Bold Digit Nine
+            other => other,
+        })
+        .collect::<String>()
+}
+
+// TODO: Refactor create and update event
+async fn create_event(
+    hub: CalendarHub<HttpsConnector<HttpConnector>>,
+    uid: String,
+    event: IcalEvent,
+    calendar_id: &str,
+) -> Result<Response<BoxBody<Bytes, Error>>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut google_event = Event::default();
+
+    let start = NaiveDateTime::parse_from_str(
+        &event
+            .get_property("DTSTART")
+            .unwrap()
+            .value
+            .clone()
+            .unwrap()[0..15],
+        "%Y%m%dT%H%M%S",
+    )
+    .unwrap()
+    .and_utc();
+    let end = NaiveDateTime::parse_from_str(
+        &event.get_property("DTEND").unwrap().value.clone().unwrap()[0..15],
+        "%Y%m%dT%H%M%S",
+    )
+    .unwrap()
+    .and_utc();
+
+    google_event.start = Some(EventDateTime {
+        date_time: Some(start),
+        date: None,
+        time_zone: None,
+    });
+    google_event.end = Some(EventDateTime {
+        date_time: Some(end),
+        date: None,
+        time_zone: None,
+    });
+
+    let room = event
+        .get_property("LOCATION")
+        .and_then(|loc| loc.value.clone())
+        .map(|s| s.replace(r"\", ""))
+        .unwrap_or_else(|| "Kein Ort angegeben".to_string());
+
+    let i_cal_uid = convert_to_non_digits(uid.replace("@tum.de", "|").to_string());
+
+    // google_event.reminders would be useful for exams
+    if let Some(url) = event.get_property("URL").and_then(|url| url.value.clone()) {
+        google_event.source = Some(google_calendar3::api::EventSource {
+            title: Some("Link zur Lernveranstaltung".to_string()),
+            url: Some(url),
+        });
+    }
+
+    if let Some(status) = event
+        .get_property("STATUS")
+        .and_then(|status| status.value.clone())
+    {
+        google_event.status = Some(status.to_lowercase());
+    }
+
+    match event
+        .get_property("SUMMARY")
+        .and_then(|summary| summary.value.clone())
+    {
+        Some(summary) => {
+            google_event.summary = Some(replace_courses(summary.replace(r"\", "").as_str()));
+            if summary.contains("Prüfung") {
+                // Big important :o
+                google_event.color_id = Some(String::from("11"));
+            }
+        }
+        None => {
+            google_event.summary = Some("Kein Titel angegeben".to_string());
+        }
+    }
+
+    google_event.location = Some(convert_to_non_digits(room.clone()));
+
+    let link = format!("https://nav.tum.de/search?q={}", room.clone());
+    let description = event
+        .get_property("DESCRIPTION")
+        .and_then(|prop| prop.value.clone())
+        .map(|desc| desc.split(r"\;").skip(2).collect())
+        .unwrap_or(String::new())
+        .as_str()
+        .replace(r"\", "")
+        .trim()
+        .to_string();
+
+    let original_description = if !description.is_empty() {
+        format!("{}<br>", description)
+    } else {
+        description
+    };
+
+    google_event.description = Some(format!(
+        "{}<a href=\"{}\">Wo ist das?</a><br><br><hr><small>uid:{}</small>",
+        original_description, link, i_cal_uid
+    ));
+
+    let results = hub
+        .events()
+        .list(calendar_id)
+        .q(&format!("uid:{}", i_cal_uid))
+        .doit()
+        .await
+        .unwrap();
+
+    let result = if let Some(event_id) = results
+        .1
+        .items
+        .and_then(|items| items.first().cloned())
+        .and_then(|event| event.id)
+    {
+        hub.events()
+            .update(google_event, calendar_id, &event_id)
+            .doit()
+            .await
+            .unwrap()
+            .0
+    } else {
+        hub.events()
+            .insert(google_event, calendar_id)
+            .doit()
+            .await
+            .unwrap()
+            .0
+    };
+    Ok(result)
+}
+
+async fn update_event(
+    hub: CalendarHub<HttpsConnector<HttpConnector>>,
+    uid: String,
+    event: IcalEvent,
+    property_changes: Vec<PropertyChange>,
+    calendar_id: &str,
+) -> Result<Response<BoxBody<Bytes, Error>>, Box<dyn std::error::Error + Send + Sync>> {
+    let i_cal_uid = convert_to_non_digits(uid.replace("@tum.de", "|").to_string());
+    let results = hub
+        .events()
+        .list(calendar_id)
+        .q(&format!("uid:{}", i_cal_uid))
+        .doit()
+        .await
+        .unwrap();
+
+    let result =
+        if let Some(oringinal_event) = results.1.items.and_then(|items| items.first().cloned()) {
+            let event_id = oringinal_event
+                .id
+                .expect("Event doesn't have internal ID??? What??");
+            let mut google_event = Event::default();
+
+            if property_changes.iter().any(|property_change| {
+                property_change.key == "DTSTART" || property_change.key == "DTEND"
+            }) {
+                let start = NaiveDateTime::parse_from_str(
+                    &event
+                        .get_property("DTSTART")
+                        .unwrap()
+                        .value
+                        .clone()
+                        .unwrap()[0..15],
+                    "%Y%m%dT%H%M%S",
+                )
+                .unwrap()
+                .and_utc();
+                let end = NaiveDateTime::parse_from_str(
+                    &event.get_property("DTEND").unwrap().value.clone().unwrap()[0..15],
+                    "%Y%m%dT%H%M%S",
+                )
+                .unwrap()
+                .and_utc();
+
+                google_event.start = Some(EventDateTime {
+                    date_time: Some(start),
+                    date: None,
+                    time_zone: None,
+                });
+                google_event.end = Some(EventDateTime {
+                    date_time: Some(end),
+                    date: None,
+                    time_zone: None,
+                });
+            } else {
+                google_event.start = oringinal_event.start;
+                google_event.end = oringinal_event.end;
+            }
+
+            // google_event.reminders would be useful for exams
+            if let Some(url) = event.get_property("URL").and_then(|url| url.value.clone()) {
+                google_event.source = Some(google_calendar3::api::EventSource {
+                    title: Some("Link zur Lernveranstaltung".to_string()),
+                    url: Some(url),
+                });
+            }
+
+            if property_changes
+                .iter()
+                .any(|property_change| property_change.key == "STATUS")
+            {
+                if let Some(status) = event
+                    .get_property("STATUS")
+                    .and_then(|status| status.value.clone())
+                {
+                    google_event.status = Some(status.to_lowercase());
+                }
+            } else {
+                google_event.status = oringinal_event.status;
+            }
+
+            if property_changes
+                .iter()
+                .any(|property_change| property_change.key == "SUMMARY")
+            {
+                match event
+                    .get_property("SUMMARY")
+                    .and_then(|summary| summary.value.clone())
+                {
+                    Some(summary) => {
+                        google_event.summary =
+                            Some(replace_courses(summary.replace(r"\", "").as_str()));
+                    }
+                    None => {
+                        google_event.summary = Some("Kein Titel angegeben".to_string());
+                    }
+                }
+            } else {
+                google_event.summary = oringinal_event.summary;
+            }
+
+            // If room has changed, update all properties associated with the room
+            let room = event
+                .get_property("LOCATION")
+                .and_then(|loc| loc.value.clone())
+                .map(|s| s.replace(r"\", ""))
+                .unwrap_or_else(|| "Kein Ort angegeben".to_string());
+            if property_changes
+                .iter()
+                .any(|property_change| property_change.key == "LOCATION")
+            {
+                google_event.location = Some(convert_to_non_digits(room.clone()));
+            } else {
+                google_event.location = oringinal_event.location;
+            }
+            // TODO: Get actual nav.tum.de link and url encode
+            let link = format!("https://nav.tum.de/search?q={}", room.clone());
+            let description = event
+                .get_property("DESCRIPTION")
+                .and_then(|prop| prop.value.clone())
+                .map(|desc| desc.split(r"\;").skip(2).collect())
+                .unwrap_or(String::new())
+                .as_str()
+                .replace(r"\", "")
+                .trim()
+                .to_string();
+
+            let original_description = if !description.is_empty() {
+                format!("{}<br>", description)
+            } else {
+                description
+            };
+
+            if property_changes.iter().any(|property_change| {
+                property_change.key == "DESCRIPTION" || property_change.key == "LOCATION"
+            }) {
+                google_event.description = Some(format!(
+                    "{}<a href=\"{}\">Wo ist das?</a><br><br><hr><small>uid:{}</small>",
+                    original_description, link, i_cal_uid
+                ));
+            } else {
+                google_event.description = oringinal_event.description;
+            }
+
+            hub.events()
+                .update(google_event, calendar_id, &event_id)
+                .doit()
+                .await
+                .unwrap()
+                .0
+        } else {
+            let response = Response::builder()
+                .status(StatusCode::IM_A_TEAPOT)
+                .body(BoxBody::default())
+                .unwrap();
+
+            response
+        };
+
+    Ok(result)
+}
+
+async fn delete_event(
+    hub: CalendarHub<HttpsConnector<HttpConnector>>,
+    uid: String,
+    calendar_id: &str,
+) -> Result<Response<BoxBody<Bytes, Error>>, Box<dyn std::error::Error + Send + Sync>> {
+    let i_cal_uid = convert_to_non_digits(uid.replace("@tum.de", "|").to_string());
+    let results = hub
+        .events()
+        .list(calendar_id)
+        .q(&format!("uid:{}", i_cal_uid))
+        .doit()
+        .await
+        .unwrap();
+
+    let result = if let Some(event_id) = results
+        .1
+        .items
+        .and_then(|items| items.first().cloned())
+        .and_then(|event| event.id)
+    {
+        hub.events()
+            .delete(calendar_id, &event_id)
+            .doit()
+            .await
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(StatusCode::IM_A_TEAPOT)
+            .body(BoxBody::default())
+            .unwrap()
+    };
+    Ok(result)
+}
+
+pub async fn tum_google_sync(
+    calendar_id: &str,
+    _: Option<String>,
+    _: Option<String>,
+    events: Vec<CalendarEvent>,
+) {
+    let secret: yup_oauth2::ApplicationSecret =
+        read_application_secret(Path::new(".secrets/client_secret.json"))
+            .await
+            .expect("Failed to read client secret");
+
+    let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
+        secret,
+        yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
+    )
+    .persist_tokens_to_disk(".secrets/token_cache.json")
+    .build()
+    .await
+    .unwrap();
+
+    auth.token(&["https://www.googleapis.com/auth/calendar"])
+        .await
+        .expect("Unable to get scope for calendar");
+
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .unwrap()
+                .https_or_http()
+                .enable_http1()
+                .build(),
+        );
+    let hub = CalendarHub::new(client, auth);
+
+    for event in events {
+        let hub = hub.clone();
+        let calendar_id = calendar_id;
+
+        let result = match event {
+            CalendarEvent::Setup(EventData { uid, ical_data }) => {
+                // Don't sync if event is a video transmission
+                if ical_data
+                    .get_property("DESCRIPTION")
+                    .and_then(|prop| prop.value.clone())
+                    .map(|desc| desc.contains("Videoübertragung aus"))
+                    .unwrap_or(false)
+                {
+                    Err(format!(
+                        "Skipping video transmission event {:?}",
+                        ical_data.get_property("SUMMARY"),
+                    )
+                    .into())
+                } else {
+                    create_event(hub, uid, ical_data, calendar_id).await
+                }
+            }
+            CalendarEvent::Created(EventData { uid, ical_data }) => {
+                // Don't sync if event is a video transmission
+                if ical_data
+                    .get_property("DESCRIPTION")
+                    .and_then(|prop| prop.value.clone())
+                    .map(|desc| desc.contains("Videoübertragung aus"))
+                    .unwrap_or(false)
+                {
+                    Err("Skipping video transmission event".into())
+                } else {
+                    create_event(hub, uid, ical_data, calendar_id).await
+                }
+            }
+            CalendarEvent::Updated {
+                event: EventData { uid, ical_data },
+                changed_properties,
+            } => update_event(hub, uid, ical_data, changed_properties, calendar_id).await,
+            CalendarEvent::Deleted { uid } => delete_event(hub, uid, calendar_id).await,
+        };
+
+        match result {
+            Ok(_) => (),
+            Err(error) => eprintln!("{:?}", error),
+        }
+
+        sleep(Duration::from_millis(300)).await;
     }
 }
 
