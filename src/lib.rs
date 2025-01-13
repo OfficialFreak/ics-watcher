@@ -674,6 +674,10 @@ async fn update_event(
                     Some(summary) => {
                         google_event.summary =
                             Some(replace_courses(summary.replace(r"\", "").as_str()));
+                        if summary.contains("Prüfung") {
+                            // Big important :o
+                            google_event.color_id = Some(String::from("11"));
+                        }
                     }
                     None => {
                         google_event.summary = Some("Kein Titel angegeben".to_string());
