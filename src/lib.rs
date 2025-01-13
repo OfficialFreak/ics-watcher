@@ -844,6 +844,7 @@ pub async fn tum_google_sync(
                     )
                     .into())
                 } else {
+                    println!("Setting up event {uid}");
                     create_event(hub, uid, ical_data, calendar_id).await
                 }
             }
@@ -857,22 +858,27 @@ pub async fn tum_google_sync(
                 {
                     Err("Skipping video transmission event".into())
                 } else {
+                    println!("Creating event {uid}");
                     create_event(hub, uid, ical_data, calendar_id).await
                 }
             }
             CalendarEvent::Updated {
                 event: EventData { uid, ical_data },
                 changed_properties,
-            } => update_event(hub, uid, ical_data, changed_properties, calendar_id).await,
-            CalendarEvent::Deleted { uid } => delete_event(hub, uid, calendar_id).await,
+            } => {
+                println!("Updating event {uid}");
+                update_event(hub, uid, ical_data, changed_properties, calendar_id).await
+            }
+            CalendarEvent::Deleted { uid } => {
+                println!("Deleting event {uid}");
+                delete_event(hub, uid, calendar_id).await
+            }
         };
 
         match result {
             Ok(_) => (),
             Err(error) => eprintln!("{:?}", error),
         }
-
-        sleep(Duration::from_millis(300)).await;
     }
 }
 
