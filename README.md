@@ -10,6 +10,7 @@ A Rust library that watches ICS calendar files. You give ICS Watcher a URL point
   - `replacements.json` taken from https://github.com/TUM-Dev/CalendarProxy/ and modified
 
 ## TODO's
+
 - Clean up error handling
 - **TUM Sync**
   - Refactor TUM Sync creation and deletion of events
@@ -17,5 +18,17 @@ A Rust library that watches ICS calendar files. You give ICS Watcher a URL point
 - Fix the examples in the docs (they work, they just don't pass the docs tests because they're async)
 - Publishing the crate to crates.io
 
-## Contributing
-Issues and Pull Requests are welcome :)
+## License
+
+Licensed under either of:
+
+ * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.
