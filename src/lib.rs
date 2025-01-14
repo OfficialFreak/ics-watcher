@@ -993,7 +993,7 @@ pub async fn tum_google_sync(
             } => update_event(hub, uid, ical_data, changed_properties, calendar_id).await,
             CalendarEvent::Deleted(EventData { uid, ical_data }) => {
                 println!("Deleting event {uid}");
-                // If the event is in the past, we assume it's just the calendar updating
+                // If the event is in the far past, we assume it's just the calendar updating
                 // for the next semester, which means we don't actually need to delete it
                 let end = NaiveDateTime::parse_from_str(
                     &ical_data
@@ -1006,8 +1006,8 @@ pub async fn tum_google_sync(
                 )
                 .unwrap()
                 .and_utc();
-                if end < Utc::now() {
-                    Err("Not deleting event as it is in the past".into())
+                if end < Utc::now() - Duration::from_secs(60 * 24 * 7) {
+                    Err("Not deleting event as it is far back in the past".into())
                 } else {
                     delete_event(hub, uid, calendar_id).await
                 }
