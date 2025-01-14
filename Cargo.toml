@@ -1,7 +1,13 @@
 [package]
 name = "ics-watcher"
+description = "A lightweight crate for monitoring ICS files or links and detecting changes, additions, and removals."
 version = "0.1.0"
 edition = "2021"
+authors = ["OfficialBrot"]
+repository = "https://github.com/OfficialFreak/ics-watcher"
+license = "MIT OR Apache-2.0"
+keywords = ["ics", "poll"]
+categories = ["asynchronous", "api-bindings"]
 
 [dependencies]
 chrono = "0.4.39"
