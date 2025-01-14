@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, Utc};
 use http_body_util::combinators::BoxBody;
 
 use ical::{
@@ -177,9 +177,7 @@ pub enum CalendarEvent {
         event: EventData,
         changed_properties: Vec<PropertyChange>,
     },
-    Deleted {
-        uid: String,
-    },
+    Deleted(EventData),
 }
 
 /// Handling change detection of a single calendar (as one ics file can contain multiple calendars)
@@ -288,11 +286,9 @@ impl CalendarChangeDetector {
             }
         }
 
-        for event_uid in self.previous.keys() {
-            if !new_previous.contains_key(event_uid) {
-                result.push(CalendarEvent::Deleted {
-                    uid: event_uid.clone(),
-                });
+        for (uid, ical_data) in self.previous.drain() {
+            if !new_previous.contains_key(&uid) {
+                result.push(CalendarEvent::Deleted(EventData { uid, ical_data }));
             }
         }
 
@@ -467,8 +463,8 @@ pub async fn log_events(
             } => {
                 println!("Updated {}: {:?}\n", event.uid, changed_properties)
             }
-            CalendarEvent::Deleted { uid } => {
-                println!("Deleted {uid}\n")
+            CalendarEvent::Deleted(EventData { uid, ical_data }) => {
+                println!("Deleted {uid}: {ical_data:?}\n")
             }
         }
     }
@@ -995,9 +991,26 @@ pub async fn tum_google_sync(
                 event: EventData { uid, ical_data },
                 changed_properties,
             } => update_event(hub, uid, ical_data, changed_properties, calendar_id).await,
-            CalendarEvent::Deleted { uid } => {
+            CalendarEvent::Deleted(EventData { uid, ical_data }) => {
                 println!("Deleting event {uid}");
-                delete_event(hub, uid, calendar_id).await
+                // If the event is in the past, we assume it's just the calendar updating
+                // for the next semester, which means we don't actually need to delete it
+                let end = NaiveDateTime::parse_from_str(
+                    &ical_data
+                        .get_property("DTEND")
+                        .unwrap()
+                        .value
+                        .clone()
+                        .unwrap()[0..15],
+                    "%Y%m%dT%H%M%S",
+                )
+                .unwrap()
+                .and_utc();
+                if end < Utc::now() {
+                    Err("Not deleting event as it is in the past".into())
+                } else {
+                    delete_event(hub, uid, calendar_id).await
+                }
             }
         };
 
