@@ -35,7 +35,7 @@ use google_calendar3::{
     CalendarHub,
 };
 
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
 use sanitize_filename::sanitize;
@@ -470,23 +470,23 @@ pub async fn log_events(
     }
 }
 
-lazy_static! {
-    static ref REPLACEMENTS: Arc<Vec<(String, String)>> = {
-        let courses_json = include_str!("../replacements.json");  // Path relative to src/
-        let raw_replacements: HashMap<String, String> = serde_json::from_str(courses_json).unwrap();
+static REPLACEMENTS: Lazy<Arc<Vec<(String, String)>>> = Lazy::new(|| {
+    let courses_json =
+        fs::read_to_string("replacements.json").expect("Failed to read replacements.json");
+    let raw_replacements: HashMap<String, String> =
+        serde_json::from_str(&courses_json).expect("Failed to parse replacements.json");
 
-        let mut replacements: Vec<(String, String)> = raw_replacements.into_iter().collect();
-        replacements.sort_by(|(a_key, _), (b_key, _)| {
-            if a_key.len() != b_key.len() {
-                b_key.len().cmp(&a_key.len())
-            } else {
-                a_key.cmp(b_key)
-            }
-        });
+    let mut replacements: Vec<(String, String)> = raw_replacements.into_iter().collect();
+    replacements.sort_by(|(a_key, _), (b_key, _)| {
+        if a_key.len() != b_key.len() {
+            b_key.len().cmp(&a_key.len())
+        } else {
+            a_key.cmp(b_key)
+        }
+    });
 
-        Arc::new(replacements)
-    };
-}
+    Arc::new(replacements)
+});
 
 fn remove_lv_id(text: &str) -> String {
     // Matches [AA1234] or (AA1234) where A is any uppercase letter and 1234 is any four digits
