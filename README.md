@@ -26,7 +26,7 @@ Licensed under either of:
 
 at your option.
 
-The TUM Google Sync can also function as a summary shortener using the `replacements.json`. Due to licensing restrictions, I do not distribute it myself, but you can find a good `replacements.json` here: [https://github.com/TUM-Dev/CalendarProxy].
+The TUM Google Sync can also function as a summary shortener using the `replacements.json`. Due to licensing restrictions, I do not distribute it myself, but you can find a good `replacements.json` here: https://github.com/TUM-Dev/CalendarProxy.
 
 ### Contribution
 
