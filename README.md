@@ -6,8 +6,8 @@ A Rust library that watches ICS calendar files. You give ICS Watcher a URL point
 
 - **Log all events**: pass `log_events` as one of the callbacks
 - **TUM to Google Calendar Proxy**: pass `tum_google_sync` as one of the callbacks
+  - This is already implemented in `main.rs` which means, you can create a `.env` with your `TUM_URL` and `GOOGLE_CALENDAR_ID`, put your Google Calendar API client secret in `.secrets/client_secret.json` and start syncing :)
   - Unlike https://github.com/TUM-Dev/CalendarProxy/, events in this implementation can be modified (which is the main reason for creating this crate)
-  - `replacements.json` taken from https://github.com/TUM-Dev/CalendarProxy/ and modified
 
 ## TODO's
 
@@ -16,7 +16,6 @@ A Rust library that watches ICS calendar files. You give ICS Watcher a URL point
   - Refactor TUM Sync creation and deletion of events
   - Introduce reminders for exams
 - Fix the examples in the docs (they work, they just don't pass the docs tests because they're async)
-- Publishing the crate to crates.io
 
 ## License
 

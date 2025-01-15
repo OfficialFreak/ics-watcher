@@ -77,7 +77,7 @@ fn rfc5545_to_std_duration(rfc_duration: &str) -> Duration {
             digit if digit.is_ascii_digit() => {
                 number.push(digit);
             }
-            '-' => {} // Handle negative durations if needed
+            '-' => {}
             _ => {}
         }
     }
@@ -775,7 +775,7 @@ async fn update_event(
                         google_event.summary =
                             Some(replace_courses(summary.replace(r"\", "").as_str()));
                         if summary.contains("Prüfung") {
-                            // Big important :o
+                            // 11 = Tomato (Google Calendar's Red)
                             google_event.color_id = Some(String::from("11"));
                         }
                     }
@@ -789,7 +789,7 @@ async fn update_event(
                     .clone()
                     .is_some_and(|summary| summary.contains("Prüfung"))
                 {
-                    // Big important :o
+                    // 11 = Tomato (Google Calendar's Red)
                     google_event.color_id = Some(String::from("11"));
                 }
                 google_event.summary = oringinal_event.summary;
@@ -809,7 +809,6 @@ async fn update_event(
             } else {
                 google_event.location = oringinal_event.location;
             }
-            // TODO: Get actual nav.tum.de link and url encode
             let link = format!("https://nav.tum.de/search?q={}", room.clone());
             let description = event
                 .get_property("DESCRIPTION")
