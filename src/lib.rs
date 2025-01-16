@@ -15,7 +15,6 @@ use std::{
 };
 
 use chrono::{NaiveDateTime, Utc};
-use http_body_util::combinators::BoxBody;
 
 use ical::{
     parser::{
@@ -28,7 +27,6 @@ use ical::{
 
 use google_calendar3::{
     api::{Event, EventDateTime},
-    hyper::{body::Bytes, Error, Response},
     hyper_rustls::{self, HttpsConnector},
     hyper_util::{self, client::legacy::connect::HttpConnector},
     yup_oauth2::{self, read_application_secret},
@@ -37,7 +35,6 @@ use google_calendar3::{
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::StatusCode;
 use sanitize_filename::sanitize;
 use tokio::time::sleep;
 
@@ -227,10 +224,17 @@ impl CalendarChangeDetector {
         let mut result = Vec::with_capacity(calendar.events.len());
 
         for event in calendar.events {
-            let event_uid = event
+            let event_uid_property = match event
                 .get_property("UID")
                 .and_then(|prop| prop.value.clone())
-                .expect("Event is missing a UID")
+            {
+                Some(uid) => uid,
+                None => {
+                    println!("Warning: An event is missing a UID, skipping");
+                    continue;
+                }
+            };
+            let event_uid = event_uid_property
                 + &event
                     .get_property("RECURRENCE-ID")
                     .map(|prop| match prop.value.clone() {
@@ -304,7 +308,9 @@ pub type CalendarCallback = Box<
         Option<String>,
         Option<String>,
         Vec<CalendarEvent>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>,
+    >,
 >;
 /// Instantiate an [ICSWatcher] using [ICSWatcher::new] to watch for changes of an ics link.
 ///
@@ -375,10 +381,14 @@ impl<'a> ICSWatcher<'a> {
     }
 
     pub async fn update(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let res = reqwest::get(self.ics_link).await?.text().await?;
-
-        let buf = BufReader::new(res.as_bytes());
-        let calendar = IcalParser::new(buf).next().unwrap().unwrap();
+        let res = reqwest::get(self.ics_link).await?;
+        // If server doesn't return 200, return with error
+        if let Err(error) = res.error_for_status_ref() {
+            return Err(error.into());
+        }
+        let res_text = res.text().await?;
+        let buf = BufReader::new(res_text.as_bytes());
+        let calendar = IcalParser::new(buf).next().ok_or("No Calendar present")??;
 
         let events = self.change_detector.compare(calendar);
 
@@ -396,7 +406,10 @@ impl<'a> ICSWatcher<'a> {
                 .collect();
 
             for future in futures {
-                future.await;
+                match future.await {
+                    Ok(()) => (),
+                    Err(err) => eprintln!("Error in callback: {err:?}"),
+                }
             }
         }
 
@@ -440,7 +453,7 @@ pub async fn log_events(
     name: Option<String>,
     description: Option<String>,
     events: Vec<CalendarEvent>,
-) {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(
         "Captured changes of {}{}:",
         name.as_deref().unwrap_or("Unnamed Calendar"),
@@ -468,13 +481,20 @@ pub async fn log_events(
             }
         }
     }
+
+    Ok(())
 }
 
 static REPLACEMENTS: Lazy<Arc<Vec<(String, String)>>> = Lazy::new(|| {
-    let courses_json =
-        fs::read_to_string("replacements.json").expect("Failed to read replacements.json");
-    let raw_replacements: HashMap<String, String> =
-        serde_json::from_str(&courses_json).expect("Failed to parse replacements.json");
+    let courses_json = match fs::read_to_string("replacements.json") {
+        Ok(content) => content,
+        Err(_) => return Arc::new(Vec::new()),
+    };
+
+    let raw_replacements: HashMap<String, String> = match serde_json::from_str(&courses_json) {
+        Ok(parsed) => parsed,
+        Err(_) => return Arc::new(Vec::new()),
+    };
 
     let mut replacements: Vec<(String, String)> = raw_replacements.into_iter().collect();
     replacements.sort_by(|(a_key, _), (b_key, _)| {
@@ -488,11 +508,12 @@ static REPLACEMENTS: Lazy<Arc<Vec<(String, String)>>> = Lazy::new(|| {
     Arc::new(replacements)
 });
 
+static LV_ID_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\[(([A-Z]{2})(\d{4}))\]|\((([A-Z]{2})(\d{4}))\)").unwrap());
+
 fn remove_lv_id(text: &str) -> String {
     // Matches [AA1234] or (AA1234) where A is any uppercase letter and 1234 is any four digits
-    let pattern = r"\[(([A-Z]{2})(\d{4}))\]|\((([A-Z]{2})(\d{4}))\)";
-    let regex = Regex::new(pattern).unwrap();
-    regex.replace_all(text, "").to_string()
+    LV_ID_REGEX.replace_all(text, "").to_string()
 }
 
 fn replace_courses(input: &str) -> String {
@@ -527,25 +548,28 @@ async fn create_event(
     uid: String,
     event: IcalEvent,
     calendar_id: &str,
-) -> Result<Response<BoxBody<Bytes, Error>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut google_event = Event::default();
 
     let start = NaiveDateTime::parse_from_str(
         &event
             .get_property("DTSTART")
-            .unwrap()
+            .ok_or("Required property DTSTART missing")?
             .value
             .clone()
-            .unwrap()[0..15],
+            .ok_or("Required property value DTSTART missing")?[0..15],
         "%Y%m%dT%H%M%S",
-    )
-    .unwrap()
+    )?
     .and_utc();
     let end = NaiveDateTime::parse_from_str(
-        &event.get_property("DTEND").unwrap().value.clone().unwrap()[0..15],
+        &event
+            .get_property("DTEND")
+            .ok_or("Required property DTEND missing")?
+            .value
+            .clone()
+            .ok_or("Required property value DTEND missing")?[0..15],
         "%Y%m%dT%H%M%S",
-    )
-    .unwrap()
+    )?
     .and_utc();
 
     google_event.start = Some(EventDateTime {
@@ -627,10 +651,9 @@ async fn create_event(
         .list(calendar_id)
         .q(&format!("uid:{}", i_cal_uid))
         .doit()
-        .await
-        .unwrap();
+        .await?;
 
-    let result = if let Some(event_id) = results
+    if let Some(event_id) = results
         .1
         .items
         .and_then(|items| items.first().cloned())
@@ -639,18 +662,17 @@ async fn create_event(
         hub.events()
             .update(google_event, calendar_id, &event_id)
             .doit()
-            .await
-            .unwrap()
+            .await?
             .0
     } else {
         hub.events()
             .insert(google_event, calendar_id)
             .doit()
-            .await
-            .unwrap()
+            .await?
             .0
     };
-    Ok(result)
+
+    Ok(())
 }
 
 async fn update_event(
@@ -659,35 +681,8 @@ async fn update_event(
     event: IcalEvent,
     property_changes: Vec<PropertyChange>,
     calendar_id: &str,
-) -> Result<Response<BoxBody<Bytes, Error>>, Box<dyn std::error::Error + Send + Sync>> {
-    // The TUM Calendar seems to randomly serve english / german descriptions
-    // This looks for differences other than the first two words in english / german
-    if property_changes.len() == 1
-        && property_changes[0].key == "DESCRIPTION"
-        && property_changes[0]
-            .from
-            .as_ref()
-            .and_then(|from| from.value.as_ref())
-            .zip(
-                property_changes[0]
-                    .to
-                    .as_ref()
-                    .and_then(|to| to.value.as_ref()),
-            )
-            .map_or(false, |(from, to)| {
-                from.split(";").skip(2).collect::<String>()
-                    == to.split(";").skip(2).collect::<String>()
-            })
-    {
-        println!("Skipping language-only update. {uid}");
-        let response = Response::builder()
-            .status(StatusCode::IM_A_TEAPOT)
-            .body(BoxBody::default())
-            .unwrap();
-
-        return Ok(response);
-    }
-    println!("Updating event {uid}");
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("Updating event {uid}: {property_changes:?}");
 
     let i_cal_uid = convert_to_non_digits(uid.replace("@tum.de", "|").to_string());
     let results = hub
@@ -695,198 +690,185 @@ async fn update_event(
         .list(calendar_id)
         .q(&format!("uid:{}", i_cal_uid))
         .doit()
-        .await
-        .unwrap();
+        .await?;
 
-    let result =
-        if let Some(oringinal_event) = results.1.items.and_then(|items| items.first().cloned()) {
-            let event_id = oringinal_event
-                .id
-                .expect("Event doesn't have internal ID??? What??");
-            let mut google_event = Event::default();
+    let oringinal_event = results
+        .1
+        .items
+        .and_then(|items| items.first().cloned())
+        .ok_or("Updating not possible as event is not present anymore")?;
+    let event_id = oringinal_event
+        .id
+        .ok_or("Google didn't provide the event with an ID")?;
+    let mut google_event = Event::default();
 
-            if property_changes.iter().any(|property_change| {
-                property_change.key == "DTSTART" || property_change.key == "DTEND"
-            }) {
-                let start = NaiveDateTime::parse_from_str(
-                    &event
-                        .get_property("DTSTART")
-                        .unwrap()
-                        .value
-                        .clone()
-                        .unwrap()[0..15],
-                    "%Y%m%dT%H%M%S",
-                )
-                .unwrap()
-                .and_utc();
-                let end = NaiveDateTime::parse_from_str(
-                    &event.get_property("DTEND").unwrap().value.clone().unwrap()[0..15],
-                    "%Y%m%dT%H%M%S",
-                )
-                .unwrap()
-                .and_utc();
+    if property_changes
+        .iter()
+        .any(|property_change| property_change.key == "DTSTART" || property_change.key == "DTEND")
+    {
+        let start = NaiveDateTime::parse_from_str(
+            &event
+                .get_property("DTSTART")
+                .ok_or("Required property DTSTART missing")?
+                .value
+                .clone()
+                .ok_or("Required property value DTSTART missing")?[0..15],
+            "%Y%m%dT%H%M%S",
+        )?
+        .and_utc();
+        let end = NaiveDateTime::parse_from_str(
+            &event
+                .get_property("DTEND")
+                .ok_or("Required property DTEND missing")?
+                .value
+                .clone()
+                .ok_or("Required property DTEND value missing")?[0..15],
+            "%Y%m%dT%H%M%S",
+        )?
+        .and_utc();
 
-                google_event.start = Some(EventDateTime {
-                    date_time: Some(start),
-                    date: None,
-                    time_zone: None,
-                });
-                google_event.end = Some(EventDateTime {
-                    date_time: Some(end),
-                    date: None,
-                    time_zone: None,
-                });
-            } else {
-                google_event.start = oringinal_event.start;
-                google_event.end = oringinal_event.end;
-            }
+        google_event.start = Some(EventDateTime {
+            date_time: Some(start),
+            date: None,
+            time_zone: None,
+        });
+        google_event.end = Some(EventDateTime {
+            date_time: Some(end),
+            date: None,
+            time_zone: None,
+        });
+    } else {
+        google_event.start = oringinal_event.start;
+        google_event.end = oringinal_event.end;
+    }
 
-            // google_event.reminders would be useful for exams
-            if let Some(url) = event.get_property("URL").and_then(|url| url.value.clone()) {
-                google_event.source = Some(google_calendar3::api::EventSource {
-                    title: Some("Link zur Lernveranstaltung".to_string()),
-                    url: Some(url),
-                });
-            }
+    // google_event.reminders would be useful for exams
+    if let Some(url) = event.get_property("URL").and_then(|url| url.value.clone()) {
+        google_event.source = Some(google_calendar3::api::EventSource {
+            title: Some("Link zur Lernveranstaltung".to_string()),
+            url: Some(url),
+        });
+    }
 
-            if property_changes
-                .iter()
-                .any(|property_change| property_change.key == "STATUS")
-            {
-                if let Some(status) = event
-                    .get_property("STATUS")
-                    .and_then(|status| status.value.clone())
-                {
-                    google_event.status = Some(status.to_lowercase());
-                }
-            } else {
-                google_event.status = oringinal_event.status;
-            }
+    if property_changes
+        .iter()
+        .any(|property_change| property_change.key == "STATUS")
+    {
+        if let Some(status) = event
+            .get_property("STATUS")
+            .and_then(|status| status.value.clone())
+        {
+            google_event.status = Some(status.to_lowercase());
+        }
+    } else {
+        google_event.status = oringinal_event.status;
+    }
 
-            if property_changes
-                .iter()
-                .any(|property_change| property_change.key == "SUMMARY")
-            {
-                match event
-                    .get_property("SUMMARY")
-                    .and_then(|summary| summary.value.clone())
-                {
-                    Some(summary) => {
-                        google_event.summary =
-                            Some(replace_courses(summary.replace(r"\", "").as_str()));
-                        if summary.contains("Prüfung") {
-                            // 11 = Tomato (Google Calendar's Red)
-                            google_event.color_id = Some(String::from("11"));
-                        }
-                    }
-                    None => {
-                        google_event.summary = Some("Kein Titel angegeben".to_string());
-                    }
-                }
-            } else {
-                if oringinal_event
-                    .summary
-                    .clone()
-                    .is_some_and(|summary| summary.contains("Prüfung"))
-                {
+    if property_changes
+        .iter()
+        .any(|property_change| property_change.key == "SUMMARY")
+    {
+        match event
+            .get_property("SUMMARY")
+            .and_then(|summary| summary.value.clone())
+        {
+            Some(summary) => {
+                google_event.summary = Some(replace_courses(summary.replace(r"\", "").as_str()));
+                if summary.contains("Prüfung") {
                     // 11 = Tomato (Google Calendar's Red)
                     google_event.color_id = Some(String::from("11"));
                 }
-                google_event.summary = oringinal_event.summary;
             }
-
-            // If room has changed, update all properties associated with the room
-            let room = event
-                .get_property("LOCATION")
-                .and_then(|loc| loc.value.clone())
-                .map(|s| s.replace(r"\", ""))
-                .unwrap_or_else(|| "Kein Ort angegeben".to_string());
-            if property_changes
-                .iter()
-                .any(|property_change| property_change.key == "LOCATION")
-            {
-                google_event.location = Some(convert_to_non_digits(room.clone()));
-            } else {
-                google_event.location = oringinal_event.location;
+            None => {
+                google_event.summary = Some("Kein Titel angegeben".to_string());
             }
-            let link = format!("https://nav.tum.de/search?q={}", room.clone());
-            let description = event
-                .get_property("DESCRIPTION")
-                .and_then(|prop| prop.value.clone())
-                .map(|desc| desc.split(r"\;").skip(2).collect())
-                .unwrap_or(String::new())
-                .as_str()
-                .replace(r"\", "")
-                .trim()
-                .to_string();
+        }
+    } else {
+        if oringinal_event
+            .summary
+            .clone()
+            .is_some_and(|summary| summary.contains("Prüfung"))
+        {
+            // 11 = Tomato (Google Calendar's Red)
+            google_event.color_id = Some(String::from("11"));
+        }
+        google_event.summary = oringinal_event.summary;
+    }
 
-            let original_description = if !description.is_empty() {
-                format!("{}<br>", description)
-            } else {
-                description
-            };
+    // If room has changed, update all properties associated with the room
+    let room = event
+        .get_property("LOCATION")
+        .and_then(|loc| loc.value.clone())
+        .map(|s| s.replace(r"\", ""))
+        .unwrap_or_else(|| "Kein Ort angegeben".to_string());
+    if property_changes
+        .iter()
+        .any(|property_change| property_change.key == "LOCATION")
+    {
+        google_event.location = Some(convert_to_non_digits(room.clone()));
+    } else {
+        google_event.location = oringinal_event.location;
+    }
+    let link = format!("https://nav.tum.de/search?q={}", room.clone());
+    let description = event
+        .get_property("DESCRIPTION")
+        .and_then(|prop| prop.value.clone())
+        .map(|desc| desc.split(r"\;").skip(2).collect())
+        .unwrap_or(String::new())
+        .as_str()
+        .replace(r"\", "")
+        .trim()
+        .to_string();
 
-            if property_changes.iter().any(|property_change| {
-                property_change.key == "DESCRIPTION" || property_change.key == "LOCATION"
-            }) {
-                google_event.description = Some(format!(
-                    "{}<a href=\"{}\">Wo ist das?</a><br><br><hr><small>uid:{}</small>",
-                    original_description, link, i_cal_uid
-                ));
-            } else {
-                google_event.description = oringinal_event.description;
-            }
+    let original_description = if !description.is_empty() {
+        format!("{}<br>", description)
+    } else {
+        description
+    };
 
-            hub.events()
-                .update(google_event, calendar_id, &event_id)
-                .doit()
-                .await
-                .unwrap()
-                .0
-        } else {
-            let response = Response::builder()
-                .status(StatusCode::IM_A_TEAPOT)
-                .body(BoxBody::default())
-                .unwrap();
+    if property_changes.iter().any(|property_change| {
+        property_change.key == "DESCRIPTION" || property_change.key == "LOCATION"
+    }) {
+        google_event.description = Some(format!(
+            "{}<a href=\"{}\">Wo ist das?</a><br><br><hr><small>uid:{}</small>",
+            original_description, link, i_cal_uid
+        ));
+    } else {
+        google_event.description = oringinal_event.description;
+    }
 
-            response
-        };
+    hub.events()
+        .update(google_event, calendar_id, &event_id)
+        .doit()
+        .await?
+        .0;
 
-    Ok(result)
+    Ok(())
 }
 
 async fn delete_event(
     hub: CalendarHub<HttpsConnector<HttpConnector>>,
     uid: String,
     calendar_id: &str,
-) -> Result<Response<BoxBody<Bytes, Error>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let i_cal_uid = convert_to_non_digits(uid.replace("@tum.de", "|").to_string());
     let results = hub
         .events()
         .list(calendar_id)
         .q(&format!("uid:{}", i_cal_uid))
         .doit()
-        .await
-        .unwrap();
+        .await?;
 
-    let result = if let Some(event_id) = results
+    if let Some(event_id) = results
         .1
         .items
         .and_then(|items| items.first().cloned())
         .and_then(|event| event.id)
     {
-        hub.events()
-            .delete(calendar_id, &event_id)
-            .doit()
-            .await
-            .unwrap()
-    } else {
-        Response::builder()
-            .status(StatusCode::IM_A_TEAPOT)
-            .body(BoxBody::default())
-            .unwrap()
-    };
-    Ok(result)
+        hub.events().delete(calendar_id, &event_id).doit().await?;
+    }
+
+    Ok(())
 }
 
 /// This is a callback which synchronizes your TUM Calendar to your Google Calender.
@@ -919,7 +901,7 @@ pub async fn tum_google_sync(
     _: Option<String>,
     _: Option<String>,
     events: Vec<CalendarEvent>,
-) {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let secret: yup_oauth2::ApplicationSecret =
         read_application_secret(Path::new(".secrets/client_secret.json"))
             .await
@@ -931,8 +913,7 @@ pub async fn tum_google_sync(
     )
     .persist_tokens_to_disk(".secrets/token_cache.json")
     .build()
-    .await
-    .unwrap();
+    .await?;
 
     auth.token(&["https://www.googleapis.com/auth/calendar"])
         .await
@@ -941,8 +922,7 @@ pub async fn tum_google_sync(
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .build(
             hyper_rustls::HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .unwrap()
+                .with_native_roots()?
                 .https_or_http()
                 .enable_http1()
                 .build(),
@@ -989,35 +969,64 @@ pub async fn tum_google_sync(
             CalendarEvent::Updated {
                 event: EventData { uid, ical_data },
                 changed_properties,
-            } => update_event(hub, uid, ical_data, changed_properties, calendar_id).await,
+            } => {
+                // The TUM Calendar seems to randomly serve english / german descriptions
+                // This looks for differences other than the first two words in english / german
+                if changed_properties.len() == 1
+                    && changed_properties[0].key == "DESCRIPTION"
+                    && changed_properties[0]
+                        .from
+                        .as_ref()
+                        .and_then(|from| from.value.as_ref())
+                        .zip(
+                            changed_properties[0]
+                                .to
+                                .as_ref()
+                                .and_then(|to| to.value.as_ref()),
+                        )
+                        .map_or(false, |(from, to)| {
+                            from.split(";").skip(2).collect::<String>()
+                                == to.split(";").skip(2).collect::<String>()
+                        })
+                {
+                    Err("Update is a language-only update".into())
+                } else {
+                    update_event(hub, uid, ical_data, changed_properties, calendar_id).await
+                }
+            }
             CalendarEvent::Deleted(EventData { uid, ical_data }) => {
                 println!("Deleting event {uid}");
                 // If the event is in the far past, we assume it's just the calendar updating
                 // for the next semester, which means we don't actually need to delete it
-                let end = NaiveDateTime::parse_from_str(
-                    &ical_data
-                        .get_property("DTEND")
-                        .unwrap()
-                        .value
-                        .clone()
-                        .unwrap()[0..15],
-                    "%Y%m%dT%H%M%S",
-                )
-                .unwrap()
-                .and_utc();
-                if end < Utc::now() - Duration::from_secs(60 * 24 * 7) {
-                    Err("Not deleting event as it is far back in the past".into())
-                } else {
-                    delete_event(hub, uid, calendar_id).await
+                let end_date = ical_data
+                    .get_property("DTEND")
+                    .and_then(|prop| prop.value.clone())
+                    .and_then(|value| {
+                        if value.len() >= 15 {
+                            NaiveDateTime::parse_from_str(&value[0..15], "%Y%m%dT%H%M%S")
+                                .map(|dt| dt.and_utc())
+                                .ok()
+                        } else {
+                            None
+                        }
+                    });
+
+                match end_date {
+                    Some(end) if end < Utc::now() - Duration::from_secs(60 * 24 * 7) => {
+                        Err("Not deleting event as it is far back in the past".into())
+                    }
+                    _ => delete_event(hub, uid, calendar_id).await,
                 }
             }
         };
 
         match result {
             Ok(_) => (),
-            Err(error) => eprintln!("{:?}", error),
+            Err(error) => eprintln!("Error on syncing event: {error:?}"),
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -11,7 +11,6 @@ A Rust library that watches ICS calendar files. You give ICS Watcher a URL point
 
 ## TODO's
 
-- Clean up error handling
 - **TUM Sync**
   - Refactor TUM Sync creation and deletion of events
   - Introduce reminders for exams
