@@ -544,7 +544,7 @@ fn convert_to_non_digits(str: String) -> String {
 
 // TODO: Refactor create and update event
 async fn create_event(
-    hub: CalendarHub<HttpsConnector<HttpConnector>>,
+    hub: &CalendarHub<HttpsConnector<HttpConnector>>,
     uid: String,
     event: IcalEvent,
     calendar_id: &str,
@@ -676,7 +676,7 @@ async fn create_event(
 }
 
 async fn update_event(
-    hub: CalendarHub<HttpsConnector<HttpConnector>>,
+    hub: &CalendarHub<HttpsConnector<HttpConnector>>,
     uid: String,
     event: IcalEvent,
     property_changes: Vec<PropertyChange>,
@@ -847,7 +847,7 @@ async fn update_event(
 }
 
 async fn delete_event(
-    hub: CalendarHub<HttpsConnector<HttpConnector>>,
+    hub: &CalendarHub<HttpsConnector<HttpConnector>>,
     uid: String,
     calendar_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -930,7 +930,6 @@ pub async fn tum_google_sync(
     let hub = CalendarHub::new(client, auth);
 
     for event in events {
-        let hub = hub.clone();
         let calendar_id = calendar_id;
 
         let result = match event {
@@ -949,7 +948,7 @@ pub async fn tum_google_sync(
                     .into())
                 } else {
                     println!("Setting up event {uid}");
-                    create_event(hub, uid, ical_data, calendar_id).await
+                    create_event(&hub, uid, ical_data, calendar_id).await
                 }
             }
             CalendarEvent::Created(EventData { uid, ical_data }) => {
@@ -963,7 +962,7 @@ pub async fn tum_google_sync(
                     Err("Skipping video transmission event".into())
                 } else {
                     println!("Creating event {uid}");
-                    create_event(hub, uid, ical_data, calendar_id).await
+                    create_event(&hub, uid, ical_data, calendar_id).await
                 }
             }
             CalendarEvent::Updated {
@@ -991,7 +990,7 @@ pub async fn tum_google_sync(
                 {
                     Err("Update is a language-only update".into())
                 } else {
-                    update_event(hub, uid, ical_data, changed_properties, calendar_id).await
+                    update_event(&hub, uid, ical_data, changed_properties, calendar_id).await
                 }
             }
             CalendarEvent::Deleted(EventData { uid, ical_data }) => {
@@ -1015,7 +1014,7 @@ pub async fn tum_google_sync(
                     Some(end) if end < Utc::now() - Duration::from_secs(60 * 24 * 7) => {
                         Err("Not deleting event as it is far back in the past".into())
                     }
-                    _ => delete_event(hub, uid, calendar_id).await,
+                    _ => delete_event(&hub, uid, calendar_id).await,
                 }
             }
         };
