@@ -1,5 +1,5 @@
 use dotenv::dotenv;
-use ics_watcher::{log_events, tum_google_sync, ICSWatcher};
+use ics_watcher::{tum_google_sync, ICSWatcher};
 use std::env;
 
 #[tokio::main]
