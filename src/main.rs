@@ -13,7 +13,7 @@ async fn main() {
     let mut ics_watcher = ICSWatcher::new(
         tum_url.as_str(),
         vec![
-            Box::new(|a, b, e| Box::pin(async move { log_events(a, b, e).await })),
+            // Box::new(|a, b, e| Box::pin(async move { log_events(a, b, e).await })),
             Box::new(move |a, b, e| {
                 let calendar_id = google_calendar_id.clone();
                 Box::pin(async move { tum_google_sync(&calendar_id, a, b, e).await })

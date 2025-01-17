@@ -959,7 +959,8 @@ pub async fn tum_google_sync(
                     .map(|desc| desc.contains("Videoübertragung aus"))
                     .unwrap_or(false)
                 {
-                    Err("Skipping video transmission event".into())
+                    // Skipping video transmission event
+                    Ok(())
                 } else {
                     println!("Creating event {uid}");
                     create_event(&hub, uid, ical_data, calendar_id).await
@@ -988,7 +989,8 @@ pub async fn tum_google_sync(
                                 == to.split(";").skip(2).collect::<String>()
                         })
                 {
-                    Err("Update is a language-only update".into())
+                    // Update is a language-only update
+                    Ok(())
                 } else {
                     update_event(&hub, uid, ical_data, changed_properties, calendar_id).await
                 }
@@ -1012,7 +1014,8 @@ pub async fn tum_google_sync(
 
                 match end_date {
                     Some(end) if end < Utc::now() - Duration::from_secs(60 * 24 * 7) => {
-                        Err("Not deleting event as it is far back in the past".into())
+                        // Not deleting event as it is far back in the past
+                        Ok(())
                     }
                     _ => delete_event(&hub, uid, calendar_id).await,
                 }
