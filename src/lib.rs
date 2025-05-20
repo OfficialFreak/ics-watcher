@@ -641,9 +641,23 @@ async fn create_event(
         description
     };
 
+    let location_link = format!("<a href=\"{}\">Wo ist das?</a><br>", link);
+    let online_only = room.to_lowercase().contains("online");
+    let on_moodle = room.to_lowercase().contains("moodle");
+
     google_event.description = Some(format!(
-        "{}<a href=\"{}\">Wo ist das?</a><br><br><hr><small>uid:{}</small>",
-        original_description, link, i_cal_uid
+        "{}{}<br><hr><small>uid:{}</small>",
+        original_description,
+        if online_only {
+            if on_moodle {
+                "<a href=\"https://www.moodle.tum.de/my/\">Online auf Moodle</a><br>".into()
+            } else {
+                "Online<br>".into()
+            }
+        } else {
+            location_link
+        },
+        i_cal_uid
     ));
 
     let results = hub
@@ -809,7 +823,12 @@ async fn update_event(
     } else {
         google_event.location = oringinal_event.location;
     }
-    let link = format!("https://nav.tum.de/search?q={}", room.clone());
+
+    let link = format!(
+        "https://nav.tum.de/search?q={}",
+        google_event.location.clone().unwrap_or_default()
+    );
+
     let description = event
         .get_property("DESCRIPTION")
         .and_then(|prop| prop.value.clone())
@@ -829,9 +848,32 @@ async fn update_event(
     if property_changes.iter().any(|property_change| {
         property_change.key == "DESCRIPTION" || property_change.key == "LOCATION"
     }) {
+        let location_link = format!("<a href=\"{}\">Wo ist das?</a><br>", link);
+        let online_only = google_event
+            .location
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("online");
+        let on_moodle = google_event
+            .location
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("moodle");
         google_event.description = Some(format!(
-            "{}<a href=\"{}\">Wo ist das?</a><br><br><hr><small>uid:{}</small>",
-            original_description, link, i_cal_uid
+            "{}{}<br><hr><small>uid:{}</small>",
+            original_description,
+            if online_only {
+                if on_moodle {
+                    "<a href=\"https://www.moodle.tum.de/my/\">Online auf Moodle</a><br>".into()
+                } else {
+                    "Online<br>".into()
+                }
+            } else {
+                location_link
+            },
+            i_cal_uid
         ));
     } else {
         google_event.description = oringinal_event.description;
