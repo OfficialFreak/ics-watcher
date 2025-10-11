@@ -5,7 +5,6 @@ use std::env;
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-
     let tum_url = env::var("TUM_URL").expect("TUM_URL not found in environment");
     let google_calendar_id =
         env::var("GOOGLE_CALENDAR_ID").expect("GOOGLE_CALENDAR_ID not found in environment");

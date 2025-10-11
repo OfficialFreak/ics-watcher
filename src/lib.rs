@@ -631,6 +631,7 @@ async fn create_event(
         .map(|desc| desc.split(r"\;").skip(2).collect())
         .unwrap_or(String::new())
         .as_str()
+        .replace(r"\n", "<br>")
         .replace(r"\", "")
         .trim()
         .to_string();
@@ -835,6 +836,7 @@ async fn update_event(
         .map(|desc| desc.split(r"\;").skip(2).collect())
         .unwrap_or(String::new())
         .as_str()
+        .replace(r"\n", "<br>")
         .replace(r"\", "")
         .trim()
         .to_string();
