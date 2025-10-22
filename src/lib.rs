@@ -509,7 +509,7 @@ static REPLACEMENTS: Lazy<Arc<Vec<(String, String)>>> = Lazy::new(|| {
 });
 
 static LV_ID_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[(([A-Z]{2})(\d{4}))\]|\((([A-Z]{2})(\d{4}))\)").unwrap());
+    Lazy::new(|| Regex::new(r"\[(([A-Z]{2})(\d{4})(?:,\s*[A-Z]{2}\d{4})*)\]|\((([A-Z]{2})(\d{4})(?:,\s*[A-Z]{2}\d{4})*)\)").unwrap());
 
 fn remove_lv_id(text: &str) -> String {
     // Matches [AA1234] or (AA1234) where A is any uppercase letter and 1234 is any four digits
