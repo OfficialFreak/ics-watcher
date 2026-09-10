@@ -3,6 +3,9 @@
 //!
 //! See [ICSWatcher] to get started.
 
+pub mod apple;
+pub use apple::{tum_apple_sync, AppleCalendar, CalendarInfo};
+
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -516,7 +519,7 @@ fn remove_lv_id(text: &str) -> String {
     LV_ID_REGEX.replace_all(text, "").to_string()
 }
 
-fn replace_courses(input: &str) -> String {
+pub(crate) fn replace_courses(input: &str) -> String {
     let mut result = input.to_string();
     for (from, to) in REPLACEMENTS.iter() {
         result = result.replace(from, to);

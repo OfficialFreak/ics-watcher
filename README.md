@@ -8,6 +8,14 @@ A Rust library that watches ICS calendar files. You give ICS Watcher a URL point
 - **TUM to Google Calendar Proxy**: pass `tum_google_sync` as one of the callbacks
   - This is already implemented in `main.rs` which means, you can create a `.env` with your `TUM_URL` and `GOOGLE_CALENDAR_ID`, put your Google Calendar API client secret in `.secrets/client_secret.json` and start syncing :)
   - Unlike https://github.com/TUM-Dev/CalendarProxy/, events in this implementation can be modified (which is the main reason for creating this crate)
+- **TUM to Apple Calendar Proxy**: pass `tum_apple_sync` as one of the callbacks
+  - Behaves just like the Google sync, but talks CalDAV to iCloud instead
+  - Also implemented in `main.rs`: add `APPLE_ID`, `APPLE_APP_PASSWORD` and `APPLE_CALENDAR_NAME` (the name of the calendar as shown in the Apple Calendar app) to your `.env` and start syncing
+    - `APPLE_APP_PASSWORD` has to be an [app-specific password](https://support.apple.com/en-us/102654), your regular Apple ID password won't be accepted
+    - If you'd rather skip the calendar discovery, set `APPLE_CALENDAR_URL` to the CalDAV collection instead of `APPLE_CALENDAR_NAME`
+    - Not sure how your calendar is named? `list_icloud_calendars` returns all of them
+  - `GOOGLE_CALENDAR_ID` and the Apple variables are independent - configure one of them or both to sync to both calendars at once
+  - `AppleCalendar::connect_to` works with any other CalDAV server (Fastmail, Nextcloud, Radicale, …) as well
 
 ## TODO's
 
@@ -25,7 +33,7 @@ Licensed under either of:
 
 at your option.
 
-The TUM Google Sync can also function as a summary shortener using the `replacements.json`. Due to licensing restrictions, I do not distribute it myself, but you can find a good `replacements.json` here: https://github.com/TUM-Dev/CalendarProxy.
+The TUM Google / Apple Sync can also function as a summary shortener using the `replacements.json`. Due to licensing restrictions, I do not distribute it myself, but you can find a good `replacements.json` here: https://github.com/TUM-Dev/CalendarProxy.
 
 ### Contribution
 
