@@ -1057,7 +1057,7 @@ pub async fn tum_google_sync(
                     });
 
                 match end_date {
-                    Some(end) if end < Utc::now() - Duration::from_secs(60 * 24 * 7) => {
+                    Some(end) if end < Utc::now() - Duration::from_secs(60 * 60 * 24 * 7) => {
                         // Not deleting event as it is far back in the past
                         Ok(())
                     }
