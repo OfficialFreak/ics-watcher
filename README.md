@@ -17,6 +17,21 @@ A Rust library that watches ICS calendar files. You give ICS Watcher a URL point
   - `GOOGLE_CALENDAR_ID` and the Apple variables are independent - configure one of them or both to sync to both calendars at once
   - `AppleCalendar::connect_to` works with any other CalDAV server (Fastmail, Nextcloud, Radicale, …) as well
 
+## Moving from Google Calendar to Apple Calendar
+
+Has the Google sync been running for a while? `ics-watcher migrate` copies that calendar over to the Apple Calendar, so that the Apple sync can take over:
+
+- Events created by the Google sync keep their uid, so the Apple sync picks up right where the Google sync left off
+- Whatever you changed in Google Calendar comes along (notes, a seat number in the location, reminders, colors), and events you deleted there stay deleted
+- Events you added to the calendar yourself are copied as well, recurring ones included
+- Nothing is deleted, neither in Google nor in the Apple Calendar, and events that are in the Apple Calendar already are skipped
+
+Configure both calendars in the `.env`, stop the watcher and run the migration in the watcher's folder (it needs `.secrets` and `.backups`):
+
+1. `ics-watcher migrate` shows what would happen without writing anything - `--dump <folder>` additionally saves every event as an `.ics` file to look at
+2. `ics-watcher migrate --apply` writes to the Apple Calendar
+3. Remove `GOOGLE_CALENDAR_ID` from the `.env` and start the watcher again
+
 ## TODO's
 
 - **TUM Sync**

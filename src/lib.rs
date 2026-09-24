@@ -6,6 +6,9 @@
 pub mod apple;
 pub use apple::{tum_apple_sync, AppleCalendar, CalendarInfo};
 
+pub mod migrate;
+pub use migrate::{migrate_google_to_apple, MigrationOptions};
+
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -375,9 +378,7 @@ impl<'a> ICSWatcher<'a> {
     }
 
     pub fn load_backup(&mut self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let backup_file_path = File::open(Path::new(".backups").join(sanitize(name) + ".cbor"))?;
-
-        let state = ciborium::de::from_reader(backup_file_path)?;
+        let state = read_backup(name).map_err(|error| error as Box<dyn std::error::Error>)?;
         self.restore_state(state);
 
         Ok(())
@@ -429,6 +430,16 @@ impl<'a> ICSWatcher<'a> {
             sleep(self.change_detector.ttl).await;
         }
     }
+}
+
+/// Reads the state saved by [`ICSWatcher::create_backup`] - the events of the calendar as the
+/// watcher saw them last, keyed by their uid.
+pub fn read_backup(
+    name: &str,
+) -> Result<HashMap<String, IcalEvent>, Box<dyn std::error::Error + Send + Sync>> {
+    let backup_file = File::open(Path::new(".backups").join(sanitize(name) + ".cbor"))?;
+
+    Ok(ciborium::de::from_reader(backup_file)?)
 }
 
 /// This is a callback which logs all events.
@@ -552,6 +563,61 @@ fn convert_to_non_digits(str: String) -> String {
             other => other,
         })
         .collect::<String>()
+}
+
+/// Undoes [convert_to_non_digits]
+pub(crate) fn convert_to_digits(str: &str) -> String {
+    str.chars()
+        .map(|c| match c {
+            '𝟎' => '0',
+            '𝟏' => '1',
+            '𝟐' => '2',
+            '𝟑' => '3',
+            '𝟒' => '4',
+            '𝟓' => '5',
+            '𝟔' => '6',
+            '𝟕' => '7',
+            '𝟖' => '8',
+            '𝟗' => '9',
+            other => other,
+        })
+        .collect::<String>()
+}
+
+pub(crate) type GoogleCalendarHub = CalendarHub<HttpsConnector<HttpConnector>>;
+
+/// Connects to the Google Calendar API with the credentials in `.secrets`.
+///
+/// The first time, this opens the OAuth consent screen and caches the token afterwards.
+pub(crate) async fn google_hub(
+) -> Result<GoogleCalendarHub, Box<dyn std::error::Error + Send + Sync>> {
+    let secret: yup_oauth2::ApplicationSecret =
+        read_application_secret(Path::new(".secrets/client_secret.json"))
+            .await
+            .expect("Failed to read client secret");
+
+    let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
+        secret,
+        yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
+    )
+    .persist_tokens_to_disk(".secrets/token_cache.json")
+    .build()
+    .await?;
+
+    auth.token(&["https://www.googleapis.com/auth/calendar"])
+        .await
+        .expect("Unable to get scope for calendar");
+
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()?
+                .https_or_http()
+                .enable_http1()
+                .build(),
+        );
+
+    Ok(CalendarHub::new(client, auth))
 }
 
 // TODO: Refactor create and update event
@@ -958,32 +1024,7 @@ pub async fn tum_google_sync(
     _: Option<String>,
     events: Vec<CalendarEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let secret: yup_oauth2::ApplicationSecret =
-        read_application_secret(Path::new(".secrets/client_secret.json"))
-            .await
-            .expect("Failed to read client secret");
-
-    let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
-        secret,
-        yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
-    )
-    .persist_tokens_to_disk(".secrets/token_cache.json")
-    .build()
-    .await?;
-
-    auth.token(&["https://www.googleapis.com/auth/calendar"])
-        .await
-        .expect("Unable to get scope for calendar");
-
-    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_native_roots()?
-                .https_or_http()
-                .enable_http1()
-                .build(),
-        );
-    let hub = CalendarHub::new(client, auth);
+    let hub = google_hub().await?;
 
     for event in events {
         let calendar_id = calendar_id;

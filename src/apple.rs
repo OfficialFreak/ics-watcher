@@ -9,7 +9,11 @@
 //! See [AppleCalendar] to connect to a calendar and [tum_apple_sync] for the
 //! counterpart of [`tum_google_sync`](crate::tum_google_sync).
 
-use std::{collections::HashMap, io::BufReader, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::BufReader,
+    time::Duration,
+};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 
@@ -21,7 +25,7 @@ use ical::{
 
 use quick_xml::{escape::unescape, events::Event as XmlEvent, Reader};
 use reqwest::{
-    header::{CONTENT_TYPE, ETAG, IF_MATCH},
+    header::{CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH},
     Client, Method, StatusCode, Url,
 };
 
@@ -30,7 +34,7 @@ use crate::{replace_courses, unescape_location, CalendarEvent, EventData, Proper
 /// The CalDAV entry point of iCloud, used by [`AppleCalendar::connect`].
 pub const ICLOUD_CALDAV_URL: &str = "https://caldav.icloud.com/";
 
-const PRODID: &str = "-//ics-watcher//Apple Calendar Adapter//EN";
+pub(crate) const PRODID: &str = "-//ics-watcher//Apple Calendar Adapter//EN";
 
 const CURRENT_USER_PRINCIPAL_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -49,6 +53,11 @@ const CALENDAR_LIST_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <d:displayname/>
     <c:supported-calendar-component-set/>
   </d:prop>
+</d:propfind>"#;
+
+const OBJECT_LIST_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:getetag/></d:prop>
 </d:propfind>"#;
 
 // ---------------------------------------------------------------------------
@@ -398,8 +407,36 @@ impl AppleCalendar {
 
     /// The URL an event is stored at. Derived from the uid, so the same event always
     /// ends up at the same place - no lookup needed.
-    fn object_url(&self, uid: &str) -> Result<Url, Box<dyn std::error::Error + Send + Sync>> {
+    pub(crate) fn object_url(
+        &self,
+        uid: &str,
+    ) -> Result<Url, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.calendar_url.join(&object_name(uid))?)
+    }
+
+    /// The resource names of all calendar objects currently in the calendar.
+    pub(crate) async fn object_names(
+        &self,
+    ) -> Result<HashSet<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let resources = self
+            .dav
+            .propfind(&self.calendar_url, "1", OBJECT_LIST_BODY)
+            .await?;
+
+        Ok(resources
+            .into_iter()
+            .filter_map(|resource| {
+                let url = self.calendar_url.join(&resource.href).ok()?;
+                // The calendar collection lists itself as well
+                if url.path() == self.calendar_url.path() {
+                    return None;
+                }
+                url.path_segments()?
+                    .next_back()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| name.to_string())
+            })
+            .collect())
     }
 
     /// Returns the stored calendar object and its etag, or `None` if it doesn't exist
@@ -427,7 +464,43 @@ impl AppleCalendar {
         Ok(Some((response.text().await?, etag)))
     }
 
-    async fn put_object(
+    /// Uploads a calendar object unless there already is one at `url`.
+    ///
+    /// Returns whether the object was created.
+    pub(crate) async fn create_object(
+        &self,
+        url: &Url,
+        calendar_object: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let response = self
+            .dav
+            .request(Method::PUT, url)
+            .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
+            .header(IF_NONE_MATCH, "*")
+            .body(calendar_object.to_string())
+            .send()
+            .await?;
+        let status = response.status();
+
+        if status == StatusCode::PRECONDITION_FAILED {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            // The server usually explains why it rejected the event
+            let reason: String = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect();
+            return Err(format!("PUT {url} failed with status {status}: {reason}").into());
+        }
+
+        Ok(true)
+    }
+
+    pub(crate) async fn put_object(
         &self,
         url: &Url,
         calendar_object: &str,
@@ -482,7 +555,7 @@ impl AppleCalendar {
 ///
 /// The hash keeps the name unique even when sanitizing or truncating maps two
 /// different uids onto the same slug.
-fn object_name(uid: &str) -> String {
+pub(crate) fn object_name(uid: &str) -> String {
     let mut slug: String = uid
         .chars()
         .map(|character| {
@@ -516,7 +589,7 @@ fn fnv1a(value: &str) -> u64 {
 
 /// Escapes a value for a text property as described in
 /// [RFC 5545 3.3.11](https://datatracker.ietf.org/doc/html/rfc5545#section-3.3.11)
-fn escape_text(value: &str) -> String {
+pub(crate) fn escape_text(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
@@ -542,11 +615,10 @@ fn quote_parameter(value: &str) -> String {
     }
 }
 
-/// Appends a content line, folded to 75 octets as required by
-/// [RFC 5545 3.1](https://datatracker.ietf.org/doc/html/rfc5545#section-3.1).
+/// Appends a property as a content line, see [push_line].
 ///
 /// `value` is expected to be escaped already.
-fn push_property(
+pub(crate) fn push_property(
     calendar_object: &mut String,
     name: &str,
     parameters: &[(String, Vec<String>)],
@@ -568,6 +640,12 @@ fn push_property(
     line.push(':');
     line.push_str(value);
 
+    push_line(calendar_object, &line);
+}
+
+/// Appends a content line, folded to 75 octets as required by
+/// [RFC 5545 3.1](https://datatracker.ietf.org/doc/html/rfc5545#section-3.1).
+pub(crate) fn push_line(calendar_object: &mut String, line: &str) {
     let mut octets = 0;
     for character in line.chars() {
         if octets + character.len_utf8() > 75 {
@@ -664,7 +742,7 @@ fn parse_stored_event(calendar_object: &str) -> Option<StoredEvent> {
 // Building the event
 // ---------------------------------------------------------------------------
 
-fn format_utc(date_time: DateTime<Utc>) -> String {
+pub(crate) fn format_utc(date_time: DateTime<Utc>) -> String {
     date_time.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
@@ -698,8 +776,22 @@ fn build_description(
         .trim()
         .to_string();
 
+    let location_hint = location_hint(room)?;
+
+    Ok(if description.is_empty() {
+        location_hint
+    } else {
+        format!("{description}\n{location_hint}")
+    })
+}
+
+/// The last line of every description: where to find the room, or that the event is online.
+pub(crate) fn location_hint(
+    room: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let lowercase_room = room.to_lowercase();
-    let location_hint = if lowercase_room.contains("online") {
+
+    Ok(if lowercase_room.contains("online") {
         if lowercase_room.contains("moodle") {
             String::from("Online auf Moodle: https://www.moodle.tum.de/my/")
         } else {
@@ -709,12 +801,6 @@ fn build_description(
         let mut link = Url::parse("https://nav.tum.de/search")?;
         link.query_pairs_mut().append_pair("q", room);
         format!("Wo ist das? {link}")
-    };
-
-    Ok(if description.is_empty() {
-        location_hint
-    } else {
-        format!("{description}\n{location_hint}")
     })
 }
 
