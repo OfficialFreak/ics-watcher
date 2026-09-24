@@ -1092,7 +1092,6 @@ struct Exam {
     name: String,
     url: Url,
     etag: Option<String>,
-    calendar_object: String,
     label: String,
 }
 
@@ -1100,8 +1099,8 @@ struct Exam {
 /// [`AppleCalendar::with_exam_calendar`]) - the ones [migrate_google_to_apple] put there, or
 /// the ones created before there was an exam calendar.
 ///
-/// Every exam is copied first and only deleted from the main calendar if it didn't change in
-/// the meantime, so nothing gets lost. Without `apply`, it only reports what it would do.
+/// The server moves every exam itself, and only if it didn't change in the meantime. Without
+/// `apply`, it only reports what it would do.
 pub async fn move_exams_to_exam_calendar(
     calendar: &AppleCalendar,
     apply: bool,
@@ -1156,7 +1155,6 @@ pub async fn move_exams_to_exam_calendar(
                     name,
                     url,
                     etag,
-                    calendar_object,
                 });
             }
             // Deleted in the meantime
@@ -1188,16 +1186,12 @@ pub async fn move_exams_to_exam_calendar(
     let results: Vec<_> = stream::iter(&exams)
         .map(|exam| async move {
             let result = async {
-                // Overwrites a copy an earlier, interrupted run might have left behind
                 calendar
-                    .put_object(
+                    .move_object(
+                        &exam.url,
                         &exam_calendar_url.join(&exam.name)?,
-                        &exam.calendar_object,
-                        None,
+                        exam.etag.as_deref(),
                     )
-                    .await?;
-                calendar
-                    .delete_object(&exam.url, exam.etag.as_deref())
                     .await
             }
             .await;

@@ -669,18 +669,13 @@ impl AppleCalendar {
         Ok(())
     }
 
-    /// Deletes a calendar object - with an `etag`, only if it hasn't changed since.
-    pub(crate) async fn delete_object(
+    async fn delete_object(
         &self,
         url: &Url,
-        etag: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let response = self
             .dav
-            .send(Method::DELETE, url, |request| match etag {
-                Some(etag) => request.header(IF_MATCH, etag),
-                None => request,
-            })
+            .send(Method::DELETE, url, |request| request)
             .await?;
         let status = response.status();
 
@@ -688,14 +683,49 @@ impl AppleCalendar {
         if status == StatusCode::NOT_FOUND {
             return Ok(());
         }
+        if !status.is_success() {
+            return Err(format!("DELETE {url} failed with status {status}").into());
+        }
+
+        Ok(())
+    }
+
+    /// Moves a calendar object into another calendar of the same account - with an `etag`,
+    /// only if it didn't change since. The server does the moving, as iCloud doesn't allow
+    /// an event in two calendars at once, so it can't be copied over first.
+    pub(crate) async fn move_object(
+        &self,
+        url: &Url,
+        target_url: &Url,
+        etag: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let response = self
+            .dav
+            .send(Method::from_bytes(b"MOVE")?, url, |request| {
+                let request = request
+                    .header("Destination", target_url.as_str())
+                    .header("Overwrite", "F");
+
+                match etag {
+                    Some(etag) => request.header(IF_MATCH, etag),
+                    None => request,
+                }
+            })
+            .await?;
+        let status = response.status();
+
+        // A retry after a server error that moved it after all
+        if status == StatusCode::NOT_FOUND && self.fetch_object(target_url).await?.is_some() {
+            return Ok(());
+        }
         if status == StatusCode::PRECONDITION_FAILED {
             return Err(format!(
-                "DELETE {url} was rejected because the event changed on the server in the meantime"
+                "MOVE {url} was rejected because the event changed in the meantime or is in {target_url} already"
             )
             .into());
         }
         if !status.is_success() {
-            return Err(format!("DELETE {url} failed with status {status}").into());
+            return Err(format!("MOVE {url} to {target_url} failed with status {status}").into());
         }
 
         Ok(())
@@ -1230,17 +1260,16 @@ async fn update_event(
                 .and_then(|from| from.value.as_deref())
                 .is_some_and(|summary| summary.contains("Prüfung"))
         });
-    if target_url != url && was_exam.is_some_and(|was_exam| was_exam != exam) {
-        println!("Moving event {uid} to {target_url}");
-        calendar
-            .put_object(&target_url, &calendar_object, None)
-            .await?;
-        return calendar.delete_object(&url, etag.as_deref()).await;
-    }
-
     calendar
         .put_object(&url, &calendar_object, etag.as_deref())
-        .await
+        .await?;
+
+    if target_url != url && was_exam.is_some_and(|was_exam| was_exam != exam) {
+        println!("Moving event {uid} to {target_url}");
+        calendar.move_object(&url, &target_url, None).await?;
+    }
+
+    Ok(())
 }
 
 async fn delete_event(
@@ -1250,7 +1279,7 @@ async fn delete_event(
     // The event could be in either calendar
     for calendar_url in calendar.calendar_urls(false) {
         calendar
-            .delete_object(&calendar_url.join(&object_name(&uid))?, None)
+            .delete_object(&calendar_url.join(&object_name(&uid))?)
             .await?;
     }
 
@@ -1971,7 +2000,7 @@ mod tests {
 
         // Gone - which both of them are fine with
         assert!(calendar.fetch_object(&url).await.unwrap().is_none());
-        calendar.delete_object(&url, None).await.unwrap();
+        calendar.delete_object(&url).await.unwrap();
 
         assert_eq!(requests.lock().unwrap().len(), 2);
     }
@@ -2140,11 +2169,45 @@ mod tests {
 
         assert_eq!(
             *requests.lock().unwrap(),
+            // Updated where it is, then moved over - iCloud doesn't allow it in both at once
             vec![
                 request("GET", "exams"),
                 request("GET", "tum"),
-                request("PUT", "exams"),
-                request("DELETE", "tum")
+                request("PUT", "tum"),
+                request("MOVE", "tum")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn notices_a_move_that_went_through_despite_an_error() {
+        let answered = AtomicUsize::new(0);
+        let (server_url, requests) = test_server(move |request| {
+            if request.starts_with("MOVE") {
+                // Moved, but answered with an error - so the retry doesn't find it anymore
+                if answered.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (500, String::new())
+                } else {
+                    (404, String::new())
+                }
+            } else {
+                (200, stored_lecture())
+            }
+        })
+        .await;
+        let calendar = calendar_with_exams_on(&server_url);
+        let calendar_urls = calendar.calendar_urls(false);
+        let url = calendar_urls[0].join(&object_name(UID)).unwrap();
+        let target_url = calendar_urls[1].join(&object_name(UID)).unwrap();
+
+        calendar.move_object(&url, &target_url, None).await.unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                request("MOVE", "tum"),
+                request("MOVE", "tum"),
+                request("GET", "exams")
             ]
         );
     }
@@ -2206,11 +2269,10 @@ mod tests {
         assert_eq!(
             requests,
             vec![
-                "DELETE /calendars/tum/exam.ics",
                 "GET /calendars/tum/exam.ics",
                 "GET /calendars/tum/lecture.ics",
+                "MOVE /calendars/tum/exam.ics",
                 "PROPFIND /calendars/tum/",
-                "PUT /calendars/exams/exam.ics",
             ]
         );
     }
