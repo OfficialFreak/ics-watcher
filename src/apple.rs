@@ -791,7 +791,8 @@ fn build_calendar_object(
         .and_then(|location| location.value.clone())
         .map(|location| location.replace(r"\", ""))
         .unwrap_or_else(|| "Kein Ort angegeben".to_string());
-    let location = match inherited("LOCATION") {
+    let inherited_location = inherited("LOCATION");
+    let location = match inherited_location {
         Some(location) => RawProperty::inherited(location),
         None => RawProperty::new("LOCATION", &escape_text(&room)),
     };
@@ -826,6 +827,8 @@ fn build_calendar_object(
         .map(|sequence| sequence.saturating_add(1))
         .unwrap_or(0);
 
+    let url = event.get_property("URL").and_then(|url| url.value.clone());
+
     let now = format_utc(Utc::now());
     let mut calendar_object = String::new();
 
@@ -853,8 +856,8 @@ fn build_calendar_object(
     location.push_to(&mut calendar_object);
     description.push_to(&mut calendar_object);
 
-    if let Some(url) = event.get_property("URL").and_then(|url| url.value.clone()) {
-        push_property(&mut calendar_object, "URL", &[], &escape_text(&url));
+    if let Some(url) = &url {
+        push_property(&mut calendar_object, "URL", &[], &escape_text(url));
     }
     if let Some(status) = status {
         status.push_to(&mut calendar_object);
@@ -870,8 +873,56 @@ fn build_calendar_object(
         push_property(&mut calendar_object, "COLOR", &[], "tomato");
     }
 
+    // Whatever else the stored event has (colors, properties the calendar apps added, …) is
+    // carried over, otherwise every update from the ICS calendar would wipe it
+    if let Some(stored_event) = stored_event {
+        let mut managed = vec![
+            "UID",
+            "DTSTAMP",
+            "DTSTART",
+            "DTEND",
+            "DURATION",
+            "SUMMARY",
+            "LOCATION",
+            "DESCRIPTION",
+            "STATUS",
+            "SEQUENCE",
+            "LAST-MODIFIED",
+        ];
+        if url.is_some() {
+            managed.push("URL");
+        }
+        if is_exam {
+            managed.extend(["CATEGORIES", "COLOR"]);
+        }
+        if inherited_location.is_none() {
+            // Apple's map pin would still point to the old room
+            managed.push("X-APPLE-STRUCTURED-LOCATION");
+        }
+
+        for property in stored_event.properties.iter().filter(|property| {
+            !managed
+                .iter()
+                .any(|name| property.name.eq_ignore_ascii_case(name))
+        }) {
+            RawProperty::inherited(property).push_to(&mut calendar_object);
+        }
+    }
+
     push_property(&mut calendar_object, "SEQUENCE", &[], &sequence.to_string());
     push_property(&mut calendar_object, "LAST-MODIFIED", &[], &now);
+
+    // Alarms are always set by hand, so they're kept as they are
+    for alarm in stored_event
+        .map(|stored_event| stored_event.alarms.as_slice())
+        .unwrap_or_default()
+    {
+        calendar_object.push_str("BEGIN:VALARM\r\n");
+        for property in &alarm.properties {
+            RawProperty::inherited(property).push_to(&mut calendar_object);
+        }
+        calendar_object.push_str("END:VALARM\r\n");
+    }
     calendar_object.push_str("END:VEVENT\r\n");
     calendar_object.push_str("END:VCALENDAR\r\n");
 
@@ -1273,6 +1324,94 @@ mod tests {
         assert!(calendar_object.contains(r"LOCATION:5608.EG.011\, Hörsaal"));
         assert!(!calendar_object.contains("Alte Beschreibung"));
         assert!(calendar_object.contains("nav.tum.de"));
+    }
+
+    fn stored_event_with_extras() -> StoredEvent {
+        parse_stored_event(
+            "BEGIN:VCALENDAR\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:1234567@tum.de\r\n\
+             DTSTART:20250114T100000Z\r\n\
+             DTEND:20250114T120000Z\r\n\
+             SUMMARY:Analysis 1 alt\r\n\
+             LOCATION:Zuhause\r\n\
+             DESCRIPTION:Meine Notiz\r\n\
+             COLOR:seagreen\r\n\
+             X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC\r\n\
+             X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=Zuhause:geo:48.1,11.5\r\n\
+             BEGIN:VALARM\r\n\
+             ACTION:DISPLAY\r\n\
+             TRIGGER:-PT1H\r\n\
+             END:VALARM\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n",
+        )
+        .expect("stored event should parse")
+    }
+
+    #[test]
+    fn update_keeps_alarms_and_other_properties() {
+        let changes = vec![PropertyChange {
+            key: String::from("SUMMARY"),
+            from: Some(property("SUMMARY", "Analysis 1 alt")),
+            to: Some(property("SUMMARY", "Analysis 1")),
+        }];
+
+        let calendar_object = build_unfolded(
+            &tum_event(),
+            Some(&stored_event_with_extras()),
+            Some(&changes),
+        );
+
+        assert!(calendar_object.contains("SUMMARY:Analysis 1\r\n"));
+        assert_eq!(calendar_object.matches("SUMMARY:").count(), 1);
+        assert!(calendar_object.contains("COLOR:seagreen\r\n"));
+        assert!(calendar_object.contains("X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC\r\n"));
+        assert!(calendar_object
+            .contains("X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=Zuhause:geo:48.1,11.5\r\n"));
+        assert!(calendar_object
+            .contains("BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT1H\r\nEND:VALARM\r\n"));
+    }
+
+    #[test]
+    fn update_drops_the_map_pin_when_the_room_changes() {
+        let changes = vec![PropertyChange {
+            key: String::from("LOCATION"),
+            from: Some(property("LOCATION", "Alter Raum")),
+            to: Some(property("LOCATION", r"5608.EG.011\, Hörsaal")),
+        }];
+
+        let calendar_object = build_unfolded(
+            &tum_event(),
+            Some(&stored_event_with_extras()),
+            Some(&changes),
+        );
+
+        assert!(calendar_object.contains(r"LOCATION:5608.EG.011\, Hörsaal"));
+        assert!(!calendar_object.contains("X-APPLE-STRUCTURED-LOCATION"));
+        // Everything unrelated to the room stays
+        assert!(calendar_object.contains("COLOR:seagreen\r\n"));
+        assert!(calendar_object.contains("BEGIN:VALARM\r\n"));
+    }
+
+    #[test]
+    fn exams_keep_their_own_color_on_update() {
+        let mut event = tum_event();
+        event.properties.retain(|p| p.name != "SUMMARY");
+        event
+            .properties
+            .push(property("SUMMARY", "Prüfung Analysis"));
+        let changes = vec![PropertyChange {
+            key: String::from("SUMMARY"),
+            from: Some(property("SUMMARY", "Analysis 1 alt")),
+            to: Some(property("SUMMARY", "Prüfung Analysis")),
+        }];
+
+        let calendar_object =
+            build_unfolded(&event, Some(&stored_event_with_extras()), Some(&changes));
+
+        assert!(calendar_object.contains("COLOR:tomato\r\n"));
+        assert_eq!(calendar_object.matches("COLOR:").count(), 1);
     }
 
     #[test]
