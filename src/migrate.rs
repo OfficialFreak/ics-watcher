@@ -31,8 +31,8 @@ use reqwest::Url;
 
 use crate::{
     apple::{
-        escape_text, format_utc, location_hint, object_name, push_line, push_property,
-        AppleCalendar, PRODID,
+        escape_text, format_utc, is_exam, location_hint, object_name, parse_stored_event,
+        push_line, push_property, AppleCalendar, PRODID,
     },
     convert_to_digits, google_hub, read_backup, GoogleCalendarHub,
 };
@@ -1081,6 +1081,152 @@ pub async fn migrate_google_to_apple(
     } else {
         Err(format!(
             "{} events couldn't be written - run the migration again to retry them",
+            failed.len()
+        )
+        .into())
+    }
+}
+
+/// An exam waiting to be moved into the exam calendar
+struct Exam {
+    name: String,
+    url: Url,
+    etag: Option<String>,
+    calendar_object: String,
+    label: String,
+}
+
+/// Moves the exams that are in the main calendar over into the exam calendar (see
+/// [`AppleCalendar::with_exam_calendar`]) - the ones [migrate_google_to_apple] put there, or
+/// the ones created before there was an exam calendar.
+///
+/// Every exam is copied first and only deleted from the main calendar if it didn't change in
+/// the meantime, so nothing gets lost. Without `apply`, it only reports what it would do.
+pub async fn move_exams_to_exam_calendar(
+    calendar: &AppleCalendar,
+    apply: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let calendar_urls = calendar.calendar_urls(false);
+    let [calendar_url, exam_calendar_url] = calendar_urls.as_slice() else {
+        return Err("No exam calendar configured".into());
+    };
+
+    let names = calendar.object_names().await?;
+    let fetched: Vec<_> = stream::iter(names)
+        .map(|name| async move {
+            let url = calendar_url.join(&name)?;
+            let stored = calendar.fetch_object(&url).await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((name, url, stored))
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+
+    let mut exams = Vec::new();
+    let mut problems = Vec::new();
+    let mut event_count = 0;
+    for result in fetched {
+        match result {
+            Ok((name, url, Some((calendar_object, etag)))) => {
+                event_count += 1;
+                let Some(stored) = parse_stored_event(&calendar_object) else {
+                    problems.push(format!("{name}: couldn't be read"));
+                    continue;
+                };
+                if !is_exam(&stored.event) {
+                    continue;
+                }
+
+                let property = |name: &str| {
+                    stored
+                        .event
+                        .get_property(name)
+                        .and_then(|property| property.value.clone())
+                        .unwrap_or_default()
+                };
+                let start = property("DTSTART");
+                let date = start
+                    .get(0..8)
+                    .and_then(|date| NaiveDate::parse_from_str(date, "%Y%m%d").ok())
+                    .map(|date| date.to_string())
+                    .unwrap_or(start);
+
+                exams.push(Exam {
+                    label: format!("{date} {}", property("SUMMARY").replace('\\', "")),
+                    name,
+                    url,
+                    etag,
+                    calendar_object,
+                });
+            }
+            // Deleted in the meantime
+            Ok((_, _, None)) => (),
+            Err(error) => problems.push(error.to_string()),
+        }
+    }
+    exams.sort_by(|a, b| a.label.cmp(&b.label));
+
+    println!(
+        "Main calendar: {event_count} events, {} of them exams",
+        exams.len()
+    );
+    for exam in &exams {
+        println!("  {}", exam.label);
+    }
+    if !problems.is_empty() {
+        println!("\nProblems ({}):", problems.len());
+        for problem in &problems {
+            println!("  {problem}");
+        }
+    }
+
+    if !apply {
+        println!("\nNothing was moved - run again with --apply to move the exams.");
+        return Ok(());
+    }
+
+    let results: Vec<_> = stream::iter(&exams)
+        .map(|exam| async move {
+            let result = async {
+                // Overwrites a copy an earlier, interrupted run might have left behind
+                calendar
+                    .put_object(
+                        &exam_calendar_url.join(&exam.name)?,
+                        &exam.calendar_object,
+                        None,
+                    )
+                    .await?;
+                calendar
+                    .delete_object(&exam.url, exam.etag.as_deref())
+                    .await
+            }
+            .await;
+            (exam.label.as_str(), result)
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+
+    let mut failed: Vec<String> = results
+        .into_iter()
+        .filter_map(|(label, result)| result.err().map(|error| format!("{label}: {error}")))
+        .collect();
+    failed.sort();
+
+    println!(
+        "\nMoved {} exams, {} failed",
+        exams.len() - failed.len(),
+        failed.len()
+    );
+    for failure in &failed {
+        println!("  {failure}");
+    }
+
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} exams couldn't be moved - run it again to retry them",
             failed.len()
         )
         .into())

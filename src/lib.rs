@@ -7,7 +7,7 @@ pub mod apple;
 pub use apple::{tum_apple_sync, AppleCalendar, CalendarInfo};
 
 pub mod migrate;
-pub use migrate::{migrate_google_to_apple, MigrationOptions};
+pub use migrate::{migrate_google_to_apple, move_exams_to_exam_calendar, MigrationOptions};
 
 use std::{
     collections::HashMap,

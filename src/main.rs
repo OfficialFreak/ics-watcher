@@ -1,7 +1,7 @@
 use dotenv::dotenv;
 use ics_watcher::{
-    migrate_google_to_apple, tum_apple_sync, tum_google_sync, AppleCalendar, CalendarCallback,
-    ICSWatcher, MigrationOptions,
+    migrate_google_to_apple, move_exams_to_exam_calendar, tum_apple_sync, tum_google_sync,
+    AppleCalendar, CalendarCallback, ICSWatcher, MigrationOptions,
 };
 use std::{env, process};
 
@@ -10,13 +10,16 @@ const BACKUP_NAME: &str = "TUM Calendar";
 
 const USAGE: &str = "\
 Usage:
-  ics-watcher                     Sync the TUM calendar to the calendars configured in .env
-  ics-watcher migrate [options]   Copy the Google calendar the sync kept over to the Apple Calendar
+  ics-watcher                        Sync the TUM calendar to the calendars configured in .env
+  ics-watcher migrate [options]      Copy the Google calendar the sync kept over to the Apple Calendar
+  ics-watcher sort-exams [--apply]   Move the exams in the Apple Calendar into the exam calendar
 
 Options for migrate:
   --apply           Write to the Apple Calendar - without it, the migration only reports what it would do
   --overwrite       Replace events which already exist in the Apple Calendar instead of skipping them
-  --dump <folder>   Additionally save every event as an .ics file into <folder>";
+  --dump <folder>   Additionally save every event as an .ics file into <folder>
+
+sort-exams only reports what it would do, unless it's run with --apply.";
 
 #[tokio::main]
 async fn main() {
@@ -26,6 +29,7 @@ async fn main() {
     match arguments.first().map(String::as_str) {
         None => watch().await,
         Some("migrate") => migrate(&arguments[1..]).await,
+        Some("sort-exams") => sort_exams(&arguments[1..]).await,
         Some(_) => {
             eprintln!("{USAGE}");
             process::exit(2);
@@ -87,7 +91,41 @@ async fn apple_calendar() -> Option<AppleCalendar> {
     }
     .expect("Failed to connect to the Apple Calendar");
 
+    // Exams can go into a calendar of their own, so that they can have a color of their own
+    let apple_calendar = match (
+        env::var("APPLE_EXAM_CALENDAR_URL"),
+        env::var("APPLE_EXAM_CALENDAR_NAME"),
+    ) {
+        (Ok(calendar_url), _) => apple_calendar.with_exam_calendar_url(&calendar_url),
+        (_, Ok(calendar_name)) => apple_calendar.with_exam_calendar(&calendar_name).await,
+        _ => Ok(apple_calendar),
+    }
+    .expect("Failed to connect to the exam calendar");
+
     Some(apple_calendar)
+}
+
+async fn sort_exams(arguments: &[String]) {
+    let apply = match arguments {
+        [] => false,
+        [flag] if flag == "--apply" => true,
+        _ => {
+            eprintln!("{USAGE}");
+            process::exit(2);
+        }
+    };
+
+    let apple_calendar = apple_calendar()
+        .await
+        .expect("APPLE_ID not found in environment");
+    if apple_calendar.exam_calendar_url().is_none() {
+        panic!("APPLE_EXAM_CALENDAR_NAME not found in environment");
+    }
+
+    if let Err(error) = move_exams_to_exam_calendar(&apple_calendar, apply).await {
+        eprintln!("Sorting the exams failed: {error}");
+        process::exit(1);
+    }
 }
 
 async fn migrate(arguments: &[String]) {

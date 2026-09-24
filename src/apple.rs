@@ -335,8 +335,16 @@ async fn discover_calendars(
         .ok_or("CalDAV server didn't return a calendar-home-set")?;
     let home_url = ensure_collection_url(principal_url.join(&home_href)?)?;
 
+    list_calendars(dav, &home_url).await
+}
+
+/// The calendars in a calendar home, the collection all calendars of an account live in.
+async fn list_calendars(
+    dav: &DavClient,
+    home_url: &Url,
+) -> Result<Vec<CalendarInfo>, Box<dyn std::error::Error + Send + Sync>> {
     let mut calendars = Vec::new();
-    for resource in dav.propfind(&home_url, "1", CALENDAR_LIST_BODY).await? {
+    for resource in dav.propfind(home_url, "1", CALENDAR_LIST_BODY).await? {
         if !resource.is_calendar {
             continue;
         }
@@ -351,6 +359,31 @@ async fn discover_calendars(
     }
 
     Ok(calendars)
+}
+
+/// The URL of the calendar named `calendar_name`, or an error listing the ones there are.
+fn find_calendar(
+    calendars: &[CalendarInfo],
+    calendar_name: &str,
+) -> Result<Url, Box<dyn std::error::Error + Send + Sync>> {
+    let calendar = calendars
+        .iter()
+        .find(|calendar| {
+            calendar.supports_events && calendar.name.as_deref() == Some(calendar_name)
+        })
+        .ok_or_else(|| {
+            let available: Vec<&str> = calendars
+                .iter()
+                .filter(|calendar| calendar.supports_events)
+                .filter_map(|calendar| calendar.name.as_deref())
+                .collect();
+            format!(
+                "No calendar named {calendar_name:?} found. Available calendars: {}",
+                available.join(", ")
+            )
+        })?;
+
+    Ok(Url::parse(&calendar.url)?)
 }
 
 fn ensure_collection_url(url: Url) -> Result<Url, Box<dyn std::error::Error + Send + Sync>> {
@@ -393,6 +426,8 @@ pub async fn list_icloud_calendars(
 pub struct AppleCalendar {
     dav: DavClient,
     calendar_url: Url,
+    /// Where exams go instead, see [`AppleCalendar::with_exam_calendar`]
+    exam_calendar_url: Option<Url>,
 }
 
 impl std::fmt::Debug for AppleCalendar {
@@ -402,6 +437,10 @@ impl std::fmt::Debug for AppleCalendar {
             .debug_struct("AppleCalendar")
             .field("username", &self.dav.username)
             .field("calendar_url", &self.calendar_url.as_str())
+            .field(
+                "exam_calendar_url",
+                &self.exam_calendar_url.as_ref().map(Url::as_str),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -430,26 +469,10 @@ impl AppleCalendar {
         let dav = DavClient::new(username, password)?;
         let calendars = discover_calendars(&dav, server_url).await?;
 
-        let calendar = calendars
-            .iter()
-            .find(|calendar| {
-                calendar.supports_events && calendar.name.as_deref() == Some(calendar_name)
-            })
-            .ok_or_else(|| {
-                let available: Vec<&str> = calendars
-                    .iter()
-                    .filter(|calendar| calendar.supports_events)
-                    .filter_map(|calendar| calendar.name.as_deref())
-                    .collect();
-                format!(
-                    "No calendar named {calendar_name:?} found. Available calendars: {}",
-                    available.join(", ")
-                )
-            })?;
-
         Ok(AppleCalendar {
-            calendar_url: Url::parse(&calendar.url)?,
+            calendar_url: find_calendar(&calendars, calendar_name)?,
             dav,
+            exam_calendar_url: None,
         })
     }
 
@@ -462,20 +485,64 @@ impl AppleCalendar {
         Ok(AppleCalendar {
             dav: DavClient::new(username, password)?,
             calendar_url: ensure_collection_url(Url::parse(calendar_url)?)?,
+            exam_calendar_url: None,
         })
+    }
+
+    /// Puts exams (events with "Prüfung" in their title) into the calendar named
+    /// `calendar_name` instead, so that they can have a color of their own - Apple Calendar
+    /// only colors whole calendars, not single events. It has to belong to the same account.
+    ///
+    /// Exams which are in the main calendar already can be moved over with
+    /// [`move_exams_to_exam_calendar`](crate::move_exams_to_exam_calendar).
+    pub async fn with_exam_calendar(
+        mut self,
+        calendar_name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // All calendars of an account live side by side in its calendar home
+        let home_url = self.calendar_url.join("../")?;
+        let calendars = list_calendars(&self.dav, &home_url).await?;
+
+        self.exam_calendar_url = Some(find_calendar(&calendars, calendar_name)?);
+        Ok(self)
+    }
+
+    /// Same as [`AppleCalendar::with_exam_calendar`], but skips the discovery and uses the
+    /// calendar collection at `calendar_url` directly.
+    pub fn with_exam_calendar_url(
+        mut self,
+        calendar_url: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        self.exam_calendar_url = Some(ensure_collection_url(Url::parse(calendar_url)?)?);
+        Ok(self)
     }
 
     pub fn calendar_url(&self) -> &str {
         self.calendar_url.as_str()
     }
 
-    /// The URL an event is stored at. Derived from the uid, so the same event always
-    /// ends up at the same place - no lookup needed.
+    pub fn exam_calendar_url(&self) -> Option<&str> {
+        self.exam_calendar_url.as_ref().map(Url::as_str)
+    }
+
+    /// The URL an event is stored at in the main calendar. Derived from the uid, so the same
+    /// event always ends up at the same place - no lookup needed.
     pub(crate) fn object_url(
         &self,
         uid: &str,
     ) -> Result<Url, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.calendar_url.join(&object_name(uid))?)
+    }
+
+    /// The calendars an event can be in: the one it belongs into first, then the other one,
+    /// if exams have a calendar of their own. Events can end up in the other one when they
+    /// got moved over by hand, or were created before there was an exam calendar.
+    pub(crate) fn calendar_urls(&self, exam: bool) -> Vec<&Url> {
+        match &self.exam_calendar_url {
+            Some(exam_calendar_url) if exam => vec![exam_calendar_url, &self.calendar_url],
+            Some(exam_calendar_url) => vec![&self.calendar_url, exam_calendar_url],
+            None => vec![&self.calendar_url],
+        }
     }
 
     /// The resource names of all calendar objects currently in the calendar.
@@ -505,7 +572,7 @@ impl AppleCalendar {
 
     /// Returns the stored calendar object and its etag, or `None` if it doesn't exist
     /// (anymore).
-    async fn fetch_object(
+    pub(crate) async fn fetch_object(
         &self,
         url: &Url,
     ) -> Result<Option<(String, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
@@ -602,19 +669,30 @@ impl AppleCalendar {
         Ok(())
     }
 
-    async fn delete_object(
+    /// Deletes a calendar object - with an `etag`, only if it hasn't changed since.
+    pub(crate) async fn delete_object(
         &self,
         url: &Url,
+        etag: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let response = self
             .dav
-            .send(Method::DELETE, url, |request| request)
+            .send(Method::DELETE, url, |request| match etag {
+                Some(etag) => request.header(IF_MATCH, etag),
+                None => request,
+            })
             .await?;
         let status = response.status();
 
         // Already gone - nothing to do
         if status == StatusCode::NOT_FOUND {
             return Ok(());
+        }
+        if status == StatusCode::PRECONDITION_FAILED {
+            return Err(format!(
+                "DELETE {url} was rejected because the event changed on the server in the meantime"
+            )
+            .into());
         }
         if !status.is_success() {
             return Err(format!("DELETE {url} failed with status {status}").into());
@@ -795,12 +873,12 @@ fn extract_components(calendar_object: &str, component: &str) -> Vec<String> {
 }
 
 /// The event as it currently sits in the Apple Calendar
-struct StoredEvent {
-    event: IcalEvent,
+pub(crate) struct StoredEvent {
+    pub(crate) event: IcalEvent,
     timezones: Vec<String>,
 }
 
-fn parse_stored_event(calendar_object: &str) -> Option<StoredEvent> {
+pub(crate) fn parse_stored_event(calendar_object: &str) -> Option<StoredEvent> {
     let calendar = IcalParser::new(BufReader::new(calendar_object.as_bytes()))
         .next()?
         .ok()?;
@@ -1092,12 +1170,21 @@ fn build_calendar_object(
 // Syncing
 // ---------------------------------------------------------------------------
 
+/// Whether an event is an exam, which gets marked as one and goes into the exam calendar, if
+/// there is one.
+pub(crate) fn is_exam(event: &IcalEvent) -> bool {
+    event
+        .get_property("SUMMARY")
+        .and_then(|summary| summary.value.as_deref())
+        .is_some_and(|summary| summary.contains("Prüfung"))
+}
+
 async fn create_event(
     calendar: &AppleCalendar,
     uid: String,
     event: IcalEvent,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = calendar.object_url(&uid)?;
+    let url = calendar.calendar_urls(is_exam(&event))[0].join(&object_name(&uid))?;
     let calendar_object = build_calendar_object(&uid, &event, None, None)?;
 
     calendar.put_object(&url, &calendar_object, None).await
@@ -1111,8 +1198,16 @@ async fn update_event(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Updating event {uid}: {property_changes:?}");
 
-    let url = calendar.object_url(&uid)?;
-    let Some((stored_object, etag)) = calendar.fetch_object(&url).await? else {
+    let exam = is_exam(&event);
+    let mut stored_at = None;
+    for calendar_url in calendar.calendar_urls(exam) {
+        let url = calendar_url.join(&object_name(&uid))?;
+        if let Some((stored_object, etag)) = calendar.fetch_object(&url).await? {
+            stored_at = Some((url, stored_object, etag));
+            break;
+        }
+    }
+    let Some((url, stored_object, etag)) = stored_at else {
         // The event was deleted in the Apple Calendar - don't bring it back
         println!("Event {uid} isn't in the Apple Calendar anymore, skipping update");
         return Ok(());
@@ -1121,6 +1216,27 @@ async fn update_event(
     let stored = parse_stored_event(&stored_object);
     let calendar_object =
         build_calendar_object(&uid, &event, stored.as_ref(), Some(&property_changes))?;
+
+    // An event that just became an exam, or stopped being one, moves over to the other
+    // calendar. Otherwise it stays where it is, even if it was moved there by hand.
+    let target_url = calendar.calendar_urls(exam)[0].join(&object_name(&uid))?;
+    let was_exam = property_changes
+        .iter()
+        .find(|property_change| property_change.key == "SUMMARY")
+        .map(|property_change| {
+            property_change
+                .from
+                .as_ref()
+                .and_then(|from| from.value.as_deref())
+                .is_some_and(|summary| summary.contains("Prüfung"))
+        });
+    if target_url != url && was_exam.is_some_and(|was_exam| was_exam != exam) {
+        println!("Moving event {uid} to {target_url}");
+        calendar
+            .put_object(&target_url, &calendar_object, None)
+            .await?;
+        return calendar.delete_object(&url, etag.as_deref()).await;
+    }
 
     calendar
         .put_object(&url, &calendar_object, etag.as_deref())
@@ -1131,9 +1247,14 @@ async fn delete_event(
     calendar: &AppleCalendar,
     uid: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = calendar.object_url(&uid)?;
+    // The event could be in either calendar
+    for calendar_url in calendar.calendar_urls(false) {
+        calendar
+            .delete_object(&calendar_url.join(&object_name(&uid))?, None)
+            .await?;
+    }
 
-    calendar.delete_object(&url).await
+    Ok(())
 }
 
 fn is_video_transmission(event: &IcalEvent) -> bool {
@@ -1276,7 +1397,7 @@ mod tests {
     use super::*;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1686,24 +1807,21 @@ mod tests {
 
     const NO_DELAYS: [Duration; 3] = [Duration::ZERO; 3];
 
-    /// A calendar on a tiny local server, which answers with `statuses` one after another
-    /// (repeating the last one), so that retries can be tested without iCloud. Also returns
-    /// the number of requests the server got.
-    async fn calendar_answering(statuses: &'static [u16]) -> (AppleCalendar, Arc<AtomicUsize>) {
+    /// A tiny local server standing in for iCloud. `respond` gets the request line (e.g.
+    /// `PUT /calendars/tum/x.ics`) and returns the status and body to answer with. Also
+    /// returns the request lines the server got.
+    async fn test_server(
+        respond: impl Fn(&str) -> (u16, String) + Send + 'static,
+    ) -> (Url, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let calendar_url = Url::parse(&format!(
-            "http://{}/calendars/tum/",
-            listener.local_addr().unwrap()
-        ))
-        .unwrap();
-        let requests = Arc::new(AtomicUsize::new(0));
+        let server_url =
+            Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
 
-        let counter = requests.clone();
+        let log = requests.clone();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let index = counter.fetch_add(1, Ordering::SeqCst);
-                let status = statuses[index.min(statuses.len() - 1)];
 
                 // Read the whole request first, otherwise sending the body could fail
                 let mut request = Vec::new();
@@ -1728,21 +1846,60 @@ mod tests {
                     }
                 }
 
+                // "PUT /calendars/tum/x.ics HTTP/1.1" without the version
+                let request_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .and_then(|line| line.rsplit_once(' '))
+                    .map(|(request_line, _)| request_line.to_string())
+                    .unwrap_or_default();
+                let (status, body) = respond(&request_line);
+                log.lock().unwrap().push(request_line);
+
                 let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
 
-        let calendar = AppleCalendar {
+        (server_url, requests)
+    }
+
+    /// A calendar at `/calendars/tum/`, which doesn't wait before retrying
+    fn calendar_on(server_url: &Url) -> AppleCalendar {
+        AppleCalendar {
             dav: DavClient {
                 retry_delays: &NO_DELAYS,
                 ..DavClient::new("me@icloud.com", "abcd-efgh-ijkl-mnop").unwrap()
             },
-            calendar_url,
-        };
-        (calendar, requests)
+            calendar_url: server_url.join("calendars/tum/").unwrap(),
+            exam_calendar_url: None,
+        }
+    }
+
+    /// Same, with the exams going into `/calendars/exams/`
+    fn calendar_with_exams_on(server_url: &Url) -> AppleCalendar {
+        AppleCalendar {
+            exam_calendar_url: Some(server_url.join("calendars/exams/").unwrap()),
+            ..calendar_on(server_url)
+        }
+    }
+
+    /// A calendar on a server answering with `statuses` one after another, repeating the
+    /// last one
+    async fn calendar_answering(
+        statuses: &'static [u16],
+    ) -> (AppleCalendar, Arc<Mutex<Vec<String>>>) {
+        let answered = AtomicUsize::new(0);
+        let (server_url, requests) = test_server(move |_| {
+            let index = answered.fetch_add(1, Ordering::SeqCst);
+            (statuses[index.min(statuses.len() - 1)], String::new())
+        })
+        .await;
+
+        (calendar_on(&server_url), requests)
     }
 
     #[test]
@@ -1790,7 +1947,7 @@ mod tests {
             .create_object(&url, "BEGIN:VCALENDAR")
             .await
             .unwrap());
-        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -1804,7 +1961,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("502"));
-        assert_eq!(requests.load(Ordering::SeqCst), 1 + NO_DELAYS.len());
+        assert_eq!(requests.lock().unwrap().len(), 1 + NO_DELAYS.len());
     }
 
     #[tokio::test]
@@ -1814,9 +1971,9 @@ mod tests {
 
         // Gone - which both of them are fine with
         assert!(calendar.fetch_object(&url).await.unwrap().is_none());
-        calendar.delete_object(&url).await.unwrap();
+        calendar.delete_object(&url, None).await.unwrap();
 
-        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1829,13 +1986,232 @@ mod tests {
             .create_object(&url, "BEGIN:VCALENDAR")
             .await
             .unwrap());
-        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
 
         let error = calendar
             .put_object(&url, "BEGIN:VCALENDAR", Some("\"etag\""))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("changed on the server"));
-        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    const UID: &str = "1234567@tum.de";
+
+    fn feed_event(summary: &str) -> IcalEvent {
+        let mut event = tum_event();
+        event.properties.retain(|p| p.name != "SUMMARY");
+        event.properties.push(property("SUMMARY", summary));
+        event
+    }
+
+    fn updated(from: &str, to: &str) -> CalendarEvent {
+        CalendarEvent::Updated {
+            event: EventData {
+                uid: String::from(UID),
+                ical_data: feed_event(to),
+            },
+            changed_properties: vec![PropertyChange {
+                key: String::from("SUMMARY"),
+                from: Some(property("SUMMARY", from)),
+                to: Some(property("SUMMARY", to)),
+            }],
+        }
+    }
+
+    fn stored_lecture() -> String {
+        String::from(
+            "BEGIN:VCALENDAR\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:1234567@tum.de\r\n\
+             DTSTART:20250114T100000Z\r\n\
+             DTEND:20250114T120000Z\r\n\
+             SUMMARY:Analysis 1\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n",
+        )
+    }
+
+    /// The request for the event in `calendar`, e.g. `PUT /calendars/tum/…`
+    fn request(method: &str, calendar: &str) -> String {
+        format!("{method} /calendars/{calendar}/{}", object_name(UID))
+    }
+
+    #[test]
+    fn finds_calendars_by_name() {
+        let calendar = |name: &str, path: &str, supports_events| CalendarInfo {
+            name: Some(String::from(name)),
+            url: format!("https://caldav.example.com/1/calendars/{path}/"),
+            supports_events,
+        };
+        let calendars = vec![
+            calendar("TUM", "tum", true),
+            calendar("TUM Prüfungen", "exams", true),
+            calendar("Erinnerungen", "tasks", false),
+        ];
+
+        assert_eq!(
+            find_calendar(&calendars, "TUM Prüfungen").unwrap().as_str(),
+            "https://caldav.example.com/1/calendars/exams/"
+        );
+        let error = find_calendar(&calendars, "Erinnerungen").unwrap_err();
+        assert!(error.to_string().contains("TUM, TUM Prüfungen"));
+    }
+
+    #[tokio::test]
+    async fn puts_new_exams_into_the_exam_calendar() {
+        let (server_url, requests) = test_server(|_| (201, String::new())).await;
+        let calendar = calendar_with_exams_on(&server_url);
+
+        for summary in ["Analysis 1 Prüfung", "Analysis 1"] {
+            let created = CalendarEvent::Created(EventData {
+                uid: String::from(UID),
+                ical_data: feed_event(summary),
+            });
+            tum_apple_sync(&calendar, None, None, vec![created])
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![request("PUT", "exams"), request("PUT", "tum")]
+        );
+    }
+
+    #[tokio::test]
+    async fn updates_events_where_they_are() {
+        // The lecture was moved into the exam calendar by hand
+        let stored_at = request("GET", "exams");
+        let (server_url, requests) = test_server(move |request| {
+            if request == stored_at {
+                (200, stored_lecture())
+            } else if request.starts_with("GET") {
+                (404, String::new())
+            } else {
+                (204, String::new())
+            }
+        })
+        .await;
+        let calendar = calendar_with_exams_on(&server_url);
+
+        tum_apple_sync(
+            &calendar,
+            None,
+            None,
+            vec![updated("Analysis 1 alt", "Analysis 1")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                request("GET", "tum"),
+                request("GET", "exams"),
+                request("PUT", "exams")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn moves_events_that_became_an_exam() {
+        let stored_at = request("GET", "tum");
+        let (server_url, requests) = test_server(move |request| {
+            if request == stored_at {
+                (200, stored_lecture())
+            } else if request.starts_with("GET") {
+                (404, String::new())
+            } else {
+                (204, String::new())
+            }
+        })
+        .await;
+        let calendar = calendar_with_exams_on(&server_url);
+
+        tum_apple_sync(
+            &calendar,
+            None,
+            None,
+            vec![updated("Analysis 1", "Analysis 1 Prüfung")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                request("GET", "exams"),
+                request("GET", "tum"),
+                request("PUT", "exams"),
+                request("DELETE", "tum")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deletes_events_from_both_calendars() {
+        let (server_url, requests) = test_server(|_| (404, String::new())).await;
+        let calendar = calendar_with_exams_on(&server_url);
+
+        // Recent enough to actually get deleted
+        let mut event = feed_event("Analysis 1");
+        event.properties.retain(|p| p.name != "DTEND");
+        event
+            .properties
+            .push(property("DTEND", &format_utc(Utc::now())));
+        let deleted = CalendarEvent::Deleted(EventData {
+            uid: String::from(UID),
+            ical_data: event,
+        });
+        tum_apple_sync(&calendar, None, None, vec![deleted])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![request("DELETE", "tum"), request("DELETE", "exams")]
+        );
+    }
+
+    #[tokio::test]
+    async fn moves_existing_exams_over() {
+        let (server_url, requests) = test_server(|request| match request {
+            "PROPFIND /calendars/tum/" => (
+                207,
+                String::from(
+                    "<multistatus xmlns=\"DAV:\">\
+                     <response><href>/calendars/tum/</href></response>\
+                     <response><href>/calendars/tum/exam.ics</href></response>\
+                     <response><href>/calendars/tum/lecture.ics</href></response>\
+                     </multistatus>",
+                ),
+            ),
+            "GET /calendars/tum/exam.ics" => (
+                200,
+                stored_lecture().replace("SUMMARY:Analysis 1", "SUMMARY:Analysis 1 Prüfung"),
+            ),
+            "GET /calendars/tum/lecture.ics" => (200, stored_lecture()),
+            _ => (204, String::new()),
+        })
+        .await;
+        let calendar = calendar_with_exams_on(&server_url);
+
+        crate::move_exams_to_exam_calendar(&calendar, true)
+            .await
+            .unwrap();
+
+        let mut requests = requests.lock().unwrap().clone();
+        requests.sort();
+        assert_eq!(
+            requests,
+            vec![
+                "DELETE /calendars/tum/exam.ics",
+                "GET /calendars/tum/exam.ics",
+                "GET /calendars/tum/lecture.ics",
+                "PROPFIND /calendars/tum/",
+                "PUT /calendars/exams/exam.ics",
+            ]
+        );
     }
 }

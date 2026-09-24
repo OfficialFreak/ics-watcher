@@ -14,6 +14,9 @@ A Rust library that watches ICS calendar files. You give ICS Watcher a URL point
     - `APPLE_APP_PASSWORD` has to be an [app-specific password](https://support.apple.com/en-us/102654), your regular Apple ID password won't be accepted
     - If you'd rather skip the calendar discovery, set `APPLE_CALENDAR_URL` to the CalDAV collection instead of `APPLE_CALENDAR_NAME`
     - Not sure how your calendar is named? `list_icloud_calendars` returns all of them
+  - Want your exams in a color of their own? Apple Calendar only colors whole calendars, not single events - set `APPLE_EXAM_CALENDAR_NAME` (or `APPLE_EXAM_CALENDAR_URL`) and exams (events with "Prüfung" in their title) go into that calendar instead
+    - `ics-watcher sort-exams` moves the exams that are in the main calendar already - it only shows what it would move, until you run it with `--apply`
+    - Events stay in whichever calendar they are, so you can still move them around by hand
   - `GOOGLE_CALENDAR_ID` and the Apple variables are independent - configure one of them or both to sync to both calendars at once
   - `AppleCalendar::connect_to` works with any other CalDAV server (Fastmail, Nextcloud, Radicale, …) as well
 
@@ -30,7 +33,8 @@ Configure both calendars in the `.env`, stop the watcher and run the migration i
 
 1. `ics-watcher migrate` shows what would happen without writing anything - `--dump <folder>` additionally saves every event as an `.ics` file to look at
 2. `ics-watcher migrate --apply` writes to the Apple Calendar
-3. Remove `GOOGLE_CALENDAR_ID` from the `.env` and start the watcher again
+3. With an exam calendar, `ics-watcher sort-exams --apply` moves the exams over into it
+4. Remove `GOOGLE_CALENDAR_ID` from the `.env` and start the watcher again
 
 ## TODO's
 
