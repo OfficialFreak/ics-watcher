@@ -25,7 +25,7 @@ use reqwest::{
     Client, Method, StatusCode, Url,
 };
 
-use crate::{replace_courses, CalendarEvent, EventData, PropertyChange};
+use crate::{replace_courses, unescape_location, CalendarEvent, EventData, PropertyChange};
 
 /// The CalDAV entry point of iCloud, used by [`AppleCalendar::connect`].
 pub const ICLOUD_CALDAV_URL: &str = "https://caldav.icloud.com/";
@@ -789,7 +789,7 @@ fn build_calendar_object(
     let room = event
         .get_property("LOCATION")
         .and_then(|location| location.value.clone())
-        .map(|location| location.replace(r"\", ""))
+        .map(|location| unescape_location(&location))
         .unwrap_or_else(|| "Kein Ort angegeben".to_string());
     let inherited_location = inherited("LOCATION");
     let location = match inherited_location {
@@ -1255,6 +1255,19 @@ mod tests {
 
         assert!(calendar_object.contains("moodle.tum.de"));
         assert!(!calendar_object.contains("nav.tum.de"));
+    }
+
+    #[test]
+    fn turns_line_breaks_in_locations_into_commas() {
+        let mut event = tum_event();
+        event.properties.retain(|p| p.name != "LOCATION");
+        event
+            .properties
+            .push(property("LOCATION", r"Online: Videokonferenz\nZoom etc."));
+
+        let calendar_object = build_unfolded(&event, None, None);
+
+        assert!(calendar_object.contains(r"LOCATION:Online: Videokonferenz\, Zoom etc."));
     }
 
     #[test]

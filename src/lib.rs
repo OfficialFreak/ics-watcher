@@ -527,6 +527,15 @@ pub(crate) fn replace_courses(input: &str) -> String {
     remove_lv_id(result.as_str())
 }
 
+/// Unescapes the location of an ICS event. Locations are a single line, so line breaks
+/// become commas instead of leaving an `n` behind.
+pub(crate) fn unescape_location(location: &str) -> String {
+    location
+        .replace(r"\n", ", ")
+        .replace(r"\N", ", ")
+        .replace(r"\", "")
+}
+
 fn convert_to_non_digits(str: String) -> String {
     str.chars()
         .map(|c| match c {
@@ -589,7 +598,7 @@ async fn create_event(
     let room = event
         .get_property("LOCATION")
         .and_then(|loc| loc.value.clone())
-        .map(|s| s.replace(r"\", ""))
+        .map(|s| unescape_location(&s))
         .unwrap_or_else(|| "Kein Ort angegeben".to_string());
 
     let i_cal_uid = convert_to_non_digits(uid.replace("@tum.de", "|").to_string());
@@ -817,7 +826,7 @@ async fn update_event(
     let room = event
         .get_property("LOCATION")
         .and_then(|loc| loc.value.clone())
-        .map(|s| s.replace(r"\", ""))
+        .map(|s| unescape_location(&s))
         .unwrap_or_else(|| "Kein Ort angegeben".to_string());
     if property_changes
         .iter()
