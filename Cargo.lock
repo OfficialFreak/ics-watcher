@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "ics-watcher"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "chrono",
  "chrono-tz",
