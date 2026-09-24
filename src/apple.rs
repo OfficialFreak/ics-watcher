@@ -26,8 +26,9 @@ use ical::{
 use quick_xml::{escape::unescape, events::Event as XmlEvent, Reader};
 use reqwest::{
     header::{CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH},
-    Client, Method, StatusCode, Url,
+    Client, Method, RequestBuilder, Response, StatusCode, Url,
 };
+use tokio::time::sleep;
 
 use crate::{replace_courses, unescape_location, CalendarEvent, EventData, PropertyChange};
 
@@ -184,11 +185,39 @@ fn parse_multistatus(
     Ok(resources)
 }
 
+/// How long to wait before each retry of a request that failed for a temporary reason. iCloud
+/// answers the odd request with a 500, which works when sent again a moment later.
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+/// Whether the server had a temporary problem - unlike a 4xx, which means that the request
+/// itself is wrong and sending it again won't help.
+fn is_transient_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// Whether the request didn't get through: the connection couldn't be established, broke off
+/// or timed out.
+fn is_transient_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_request()
+}
+
 #[derive(Clone)]
 struct DavClient {
     http: Client,
     username: String,
     password: String,
+    /// See [RETRY_DELAYS]
+    retry_delays: &'static [Duration],
 }
 
 impl DavClient {
@@ -202,13 +231,47 @@ impl DavClient {
                 .build()?,
             username: username.to_string(),
             password: password.to_string(),
+            retry_delays: &RETRY_DELAYS,
         })
     }
 
-    fn request(&self, method: Method, url: &Url) -> reqwest::RequestBuilder {
+    fn request(&self, method: Method, url: &Url) -> RequestBuilder {
         self.http
             .request(method, url.clone())
             .basic_auth(&self.username, Some(&self.password))
+    }
+
+    /// Sends a request, and sends it again as long as it fails for a temporary reason (see
+    /// [is_transient_status] and [is_transient_error]), waiting a bit longer every time.
+    ///
+    /// A request can only be sent once, so `prepare` is called for every attempt to add the
+    /// headers and the body.
+    async fn send(
+        &self,
+        method: Method,
+        url: &Url,
+        prepare: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Response, reqwest::Error> {
+        let mut delays = self.retry_delays.iter();
+
+        loop {
+            let result = prepare(self.request(method.clone(), url)).send().await;
+            let problem = match &result {
+                Ok(response) if is_transient_status(response.status()) => {
+                    Some(response.status().to_string())
+                }
+                Err(error) if is_transient_error(error) => Some(error.to_string()),
+                _ => None,
+            };
+
+            match (problem, delays.next()) {
+                (Some(problem), Some(delay)) => {
+                    eprintln!("{method} {url} failed ({problem}), retrying in {delay:?}");
+                    sleep(*delay).await;
+                }
+                _ => return result,
+            }
+        }
     }
 
     async fn propfind(
@@ -218,11 +281,12 @@ impl DavClient {
         body: &'static str,
     ) -> Result<Vec<DavResource>, Box<dyn std::error::Error + Send + Sync>> {
         let response = self
-            .request(Method::from_bytes(b"PROPFIND")?, url)
-            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", depth)
-            .body(body)
-            .send()
+            .send(Method::from_bytes(b"PROPFIND")?, url, |request| {
+                request
+                    .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+                    .header("Depth", depth)
+                    .body(body)
+            })
             .await?;
 
         let status = response.status();
@@ -445,7 +509,7 @@ impl AppleCalendar {
         &self,
         url: &Url,
     ) -> Result<Option<(String, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
-        let response = self.dav.request(Method::GET, url).send().await?;
+        let response = self.dav.send(Method::GET, url, |request| request).await?;
 
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -466,7 +530,8 @@ impl AppleCalendar {
 
     /// Uploads a calendar object unless there already is one at `url`.
     ///
-    /// Returns whether the object was created.
+    /// Returns whether the object was created. When a server error stored the object after
+    /// all, the retry finds it already there and `false` is returned.
     pub(crate) async fn create_object(
         &self,
         url: &Url,
@@ -474,11 +539,12 @@ impl AppleCalendar {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let response = self
             .dav
-            .request(Method::PUT, url)
-            .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .header(IF_NONE_MATCH, "*")
-            .body(calendar_object.to_string())
-            .send()
+            .send(Method::PUT, url, |request| {
+                request
+                    .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
+                    .header(IF_NONE_MATCH, "*")
+                    .body(calendar_object.to_string())
+            })
             .await?;
         let status = response.status();
 
@@ -506,19 +572,23 @@ impl AppleCalendar {
         calendar_object: &str,
         etag: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut request = self
+        let response = self
             .dav
-            .request(Method::PUT, url)
-            .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .body(calendar_object.to_string());
+            .send(Method::PUT, url, |request| {
+                let request = request
+                    .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
+                    .body(calendar_object.to_string());
 
-        if let Some(etag) = etag {
-            request = request.header(IF_MATCH, etag);
-        }
-
-        let response = request.send().await?;
+                match etag {
+                    Some(etag) => request.header(IF_MATCH, etag),
+                    None => request,
+                }
+            })
+            .await?;
         let status = response.status();
 
+        // Also happens when a server error stored the event after all and the retry no
+        // longer matches the etag - there's no telling the two apart
         if status == StatusCode::PRECONDITION_FAILED {
             return Err(format!(
                 "PUT {url} was rejected because the event changed on the server in the meantime"
@@ -536,7 +606,10 @@ impl AppleCalendar {
         &self,
         url: &Url,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let response = self.dav.request(Method::DELETE, url).send().await?;
+        let response = self
+            .dav
+            .send(Method::DELETE, url, |request| request)
+            .await?;
         let status = response.status();
 
         // Already gone - nothing to do
@@ -1201,6 +1274,14 @@ pub async fn tum_apple_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn property(name: &str, value: &str) -> Property {
         Property {
@@ -1601,5 +1682,160 @@ mod tests {
                 .map(String::as_str),
             Some("/1234/principal/")
         );
+    }
+
+    const NO_DELAYS: [Duration; 3] = [Duration::ZERO; 3];
+
+    /// A calendar on a tiny local server, which answers with `statuses` one after another
+    /// (repeating the last one), so that retries can be tested without iCloud. Also returns
+    /// the number of requests the server got.
+    async fn calendar_answering(statuses: &'static [u16]) -> (AppleCalendar, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let calendar_url = Url::parse(&format!(
+            "http://{}/calendars/tum/",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let status = statuses[index.min(statuses.len() - 1)];
+
+                // Read the whole request first, otherwise sending the body could fail
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(head_end) = request.windows(4).position(|end| end == b"\r\n\r\n")
+                    else {
+                        if read == 0 {
+                            break;
+                        }
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                    let body_length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |length| length.trim().parse().unwrap());
+                    if read == 0 || request.len() >= head_end + 4 + body_length {
+                        break;
+                    }
+                }
+
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let calendar = AppleCalendar {
+            dav: DavClient {
+                retry_delays: &NO_DELAYS,
+                ..DavClient::new("me@icloud.com", "abcd-efgh-ijkl-mnop").unwrap()
+            },
+            calendar_url,
+        };
+        (calendar, requests)
+    }
+
+    #[test]
+    fn tells_temporary_server_errors_apart() {
+        for status in [500, 502, 503, 504] {
+            assert!(
+                is_transient_status(StatusCode::from_u16(status).unwrap()),
+                "{status}"
+            );
+        }
+        for status in [200, 201, 204, 400, 401, 403, 404, 412, 501] {
+            assert!(
+                !is_transient_status(StatusCode::from_u16(status).unwrap()),
+                "{status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tells_connection_problems_apart() {
+        // Nothing listens on the port anymore once the listener is gone
+        let port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(is_transient_error(&error));
+
+        let error = Client::new().get("not a url").send().await.unwrap_err();
+        assert!(!is_transient_error(&error));
+    }
+
+    #[tokio::test]
+    async fn retries_server_errors() {
+        let (calendar, requests) = calendar_answering(&[500, 503, 201]).await;
+        let url = calendar.object_url("1234567@tum.de").unwrap();
+
+        assert!(calendar
+            .create_object(&url, "BEGIN:VCALENDAR")
+            .await
+            .unwrap());
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_the_last_retry() {
+        let (calendar, requests) = calendar_answering(&[502]).await;
+        let url = calendar.object_url("1234567@tum.de").unwrap();
+
+        let error = calendar
+            .put_object(&url, "BEGIN:VCALENDAR", None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("502"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1 + NO_DELAYS.len());
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_client_errors() {
+        let (calendar, requests) = calendar_answering(&[404]).await;
+        let url = calendar.object_url("1234567@tum.de").unwrap();
+
+        // Gone - which both of them are fine with
+        assert!(calendar.fetch_object(&url).await.unwrap().is_none());
+        calendar.delete_object(&url).await.unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn keeps_handling_conflicts_after_a_retry() {
+        let (calendar, requests) = calendar_answering(&[500, 412]).await;
+        let url = calendar.object_url("1234567@tum.de").unwrap();
+
+        // The first attempt was stored despite the error, so the retry finds the event
+        assert!(!calendar
+            .create_object(&url, "BEGIN:VCALENDAR")
+            .await
+            .unwrap());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+        let error = calendar
+            .put_object(&url, "BEGIN:VCALENDAR", Some("\"etag\""))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed on the server"));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
     }
 }
